@@ -1,6 +1,7 @@
 import clr
 import time
 import numpy as np
+import json
 
 clr.AddReference("C:\\Program Files\\Thorlabs\\Kinesis\\Thorlabs.MotionControl.DeviceManagerCLI.dll")
 clr.AddReference("C:\\Program Files\\Thorlabs\\Kinesis\\Thorlabs.MotionControl.GenericMotorCLI.dll")
@@ -55,8 +56,7 @@ class PiezoController:
         
     def get_all_voltages(self):
         values = [self.get_voltage(sn) for sn in self.controllers]
-        matrix = np.array(values).reshape(2, 2)  # Adjust shape as needed
-        return matrix
+        return values
 
     def set_voltage(self, sn, target_voltage, step=1.0, delay=0.25):
         device = self.controllers[sn]
@@ -120,12 +120,11 @@ class QuadCellController:
         return status.PositionError
 
     def get_xy_position(self):
-        ordered_keys = sorted(self.controllers.keys(), key=int)
         values = []
-        for sn in ordered_keys:
+        for sn in self.serial_numbers:
             status = self.controllers[sn].Status.PositionDifference
             values.extend([status.X, status.Y])
-        return np.array(values).reshape(2, 2)  # Rows: [X1, Y1], [X2, Y2]
+        return values
 
     def get_signal_strength(self, sn):
         status = self.controllers[sn].GetStatus()
@@ -185,23 +184,60 @@ class LinearStageController:
         device.MoveTo(self.Channel_map[str(channel)], move_distance, 1000)  # 1 second timeout
         print("Move Complete")
 
+    def get_position(self, sn, channel):
+        device = self.controllers[sn]
+        ch = self.Channel_map[str(channel)]
+        pos = device.GetPosition(ch)
+        return float(pos)
+
     def get_all_positions(self):
         values = []
-        for sn in sorted(self.controllers.keys(), key=int):  # sort for consistent order
-            device = self.controllers[sn]
-            for ch_name in ["chan1", "chan2", "chan3", "chan4"]:
-                ch_enum = self.Channel_map[ch_name]
+        for sn in self.controllers:
+            for ch in ['chan1', 'chan2', 'chan3', 'chan4']:
                 try:
-                    pos = float(str(device.positions(ch_enum)))
-                except Exception:
-                    pos = np.nan  # use NaN for unavailable channels
-                values.append(pos)
-
-    def get_position(self, sn):
-        return float(str(self.controllers[sn].Position))
+                    pos = self.get_position(sn, ch)
+                    values.append(pos)
+                except Exception as e:
+                    print(f"Channel {ch} on device {sn} failed: {e}")
+                    values.append(None)
+        return values
 
     def shutdown(self):
         for sn, stage in self.controllers.items():
             stage.StopPolling()
             stage.Disconnect()
             print(f"Shutdown linear stage with serial {sn}")
+
+class HardwareOps:
+    def __init__(self, config_filename):
+        with open(config_filename, 'r') as f:
+            config = json.load(f)
+
+        self.piezo_serials = config["piezo_serials"]
+        self.piezo_serials_list = list(self.piezo_serials.keys())
+        self.quad_serials = config["quad_serials"]
+        self.stage_serials = config["stage_serials"]
+
+        # Now you can pass these to your controllers
+        self.piezos = PiezoController(self.piezo_serials)
+        self.quads = QuadCellController(self.quad_serials)
+        self.stages = LinearStageController(self.stage_serials)
+
+    def get_all_actuator_values(self):
+        voltages_piezo = self.piezos.get_all_voltages()
+        voltages_linear = self.stages.get_all_positions()
+        positions = self.quads.get_xy_position()
+
+        return voltages_piezo, voltages_linear, positions
+    
+    def shutdown(self):
+        print("Shutting down piezos...")
+        self.piezos.shutdown()
+
+        print("Shutting down quadcells...")
+        self.quads.shutdown()
+
+        print("Shutting down stages...")
+        self.stages.shutdown()
+
+        print("All hardware safely shut down.")

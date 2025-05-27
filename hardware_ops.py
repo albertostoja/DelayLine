@@ -177,8 +177,8 @@ class LinearStageController:
 
             stage.SetSettings(device_settings, True, True)
 
-    def move_absolute(self, serial_number, channel, distance):
-        device = self.controllers[serial_number]
+    def move_absolute(self, sn, channel, distance):
+        device = self.controllers[sn]
         move_distance = int(distance)
         print(f'Moving to position {move_distance}')
         device.MoveTo(self.Channel_map[str(channel)], move_distance, 1000)  # 1 second timeout
@@ -228,16 +228,14 @@ class HardwareOps:
         voltages_linear = self.stages.get_all_positions()
         positions = self.quads.get_xy_position()
 
-        return voltages_piezo, voltages_linear, positions
+        combined_values = list(voltages_piezo) + list(voltages_linear) + list(positions)
+        return combined_values
     
     def shutdown(self):
         print("Shutting down piezos...")
         self.piezos.shutdown()
-
         print("Shutting down quadcells...")
         self.quads.shutdown()
-
         print("Shutting down stages...")
         self.stages.shutdown()
-
         print("All hardware safely shut down.")

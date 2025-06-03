@@ -59,6 +59,9 @@ class PiezoController:
         return values
 
     def set_voltage(self, sn, target_voltage, step=1.0, delay=0.25):
+        if not (0.0 <= target_voltage <= 100.0):
+            raise ValueError(f"target_voltage must be between 0 and 100. Got {target_voltage}.")
+        
         device = self.controllers[sn]
 
         current_value = float(str(device.GetOutputVoltage()))
@@ -121,14 +124,42 @@ class QuadCellController:
 
     def get_xy_position(self):
         values = []
-        for sn in self.serial_numbers:
-            status = self.controllers[sn].Status.PositionDifference
-            values.extend([status.X, status.Y])
+        strengths = self.get_signal_strength()  # Now returns a list or tuple
+
+        for sn, strength in zip(self.serial_numbers, strengths):
+            print(f"Signal strength for {sn}: {strength}")  # DEBUG LINE
+
+            if strength > 0.08:
+                status = self.controllers[sn].Status.PositionDifference
+                values.extend([status.X, status.Y])
+            else:
+                raise ValueError(f"Signal too low for {sn}: {strength}")
         return values
 
-    def get_signal_strength(self, sn):
-        status = self.controllers[sn].GetStatus()
-        return status.TotalSignal
+    def get_xy_position_tavg(self, times=50, delay=0.04):
+        all_results = []
+
+        for _ in range(times):
+            strengths = self.get_signal_strength()  # Returns a list/tuple of strengths
+
+            for sn, strength in zip(self.serial_numbers, strengths):
+                if strength <= 0.1:
+                    raise ValueError(f"Signal strength too low for device {sn}: {strength}")
+
+            res = self.get_xy_position()  # e.g., [x1, y1, x2, y2]
+            all_results.append(res)
+            time.sleep(delay)
+
+        all_results = np.array(all_results)  # shape: (times, 4)
+        avg_result = np.mean(all_results, axis=0)  # shape: (4,)
+        return avg_result.tolist()
+
+    def get_signal_strength(self):
+        strengths = []
+        for sn in self.serial_numbers:
+            status = self.controllers[sn].Status.Sum
+            strengths.append(status)
+        return strengths
 
     def shutdown(self):
         for sn, aligner in self.controllers.items():

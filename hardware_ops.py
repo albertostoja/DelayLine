@@ -86,6 +86,10 @@ class PiezoController:
             print(f"{sn} set to {v}")
             sleep(delay)
 
+    def set_to_voltage_zero_value(piezo_list, voltage):
+        for i in range(len(piezo_list)):
+            self.set_voltage(piezo_list[i], voltage)
+
     def shutdown(self):
         for sn, piezo in self.controllers.items():
             current_val = self.get_voltage(sn)
@@ -122,14 +126,14 @@ class QuadCellController:
         status = self.controllers[sn].Status.PositionDifference
         return status.PositionError
 
-    def get_xy_position(self):
+    def get_xy_position(self, sig_strength = 0.08):
         values = []
         strengths = self.get_signal_strength()  # Now returns a list or tuple
 
         for sn, strength in zip(self.serial_numbers, strengths):
             print(f"Signal strength for {sn}: {strength}")  # DEBUG LINE
 
-            if strength > 0.08:
+            if strength > sig_strength:
                 status = self.controllers[sn].Status.PositionDifference
                 values.extend([status.X, status.Y])
             else:

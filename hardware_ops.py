@@ -131,8 +131,6 @@ class QuadCellController:
         strengths = self.get_signal_strength()  # Now returns a list or tuple
 
         for sn, strength in zip(self.serial_numbers, strengths):
-            print(f"Signal strength for {sn}: {strength}")  # DEBUG LINE
-
             if strength > sig_strength:
                 status = self.controllers[sn].Status.PositionDifference
                 values.extend([status.X, status.Y])
@@ -216,7 +214,7 @@ class LinearStageController:
         device = self.controllers[sn]
         move_distance = int(distance)
         print(f'Moving to position {move_distance}')
-        device.MoveTo(self.Channel_map[str(channel)], move_distance, 1000)  # 1 second timeout
+        device.MoveTo(self.Channel_map[str(channel)], move_distance, 10000)  # 10 second timeout
         print("Move Complete")
 
     def get_position(self, sn, channel):

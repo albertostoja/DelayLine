@@ -45,7 +45,7 @@ class PiezoController:
             piezo.StartPolling(250)
             piezo.EnableDevice()
 
-            piezo.SetMaxOutputVoltage(Decimal(100.0))
+            piezo.SetMaxOutputVoltage(Decimal(150.0))
 
             self.controllers[sn] = piezo
             self.device_types[sn] = dev_type
@@ -59,7 +59,7 @@ class PiezoController:
         return values
 
     def set_voltage(self, sn, target_voltage, step=1.0, delay=0.25):
-        if not (0.0 <= target_voltage <= 100.0):
+        if not (0.0 <= target_voltage <= 150.0):
             raise ValueError(f"target_voltage must be between 0 and 100. Got {target_voltage}.")
         
         device = self.controllers[sn]
@@ -86,7 +86,7 @@ class PiezoController:
             print(f"{sn} set to {v}")
             sleep(delay)
 
-    def set_to_voltage_zero_value(piezo_list, voltage):
+    def set_to_voltage_zero_value(self, piezo_list, voltage):
         for i in range(len(piezo_list)):
             self.set_voltage(piezo_list[i], voltage)
 

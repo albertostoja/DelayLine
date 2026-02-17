@@ -807,15 +807,25 @@ def sim_to_pt(loc_x, loc_y):
 
     return x, y
 
-def get_mount_corners(x, y, z, theta_deg):
+def get_mount_corners(x, y, z, theta_deg, 
+                      s_half=1.3/2, 
+                      shift_dist=0.045):
     """
     Calculates the 3 corners of a mirror mount given the center (x,y,z) 
-    and rotation theta, after shifting the center 0.045 inches along
-    the mirror normal toward the origin.
+    and rotation theta.
+
+    Parameters
+    ----------
+    s_half : float
+        Half side length of mirror face.
+        Default = 1.3/2 (standard mirrors).
+    shift_dist : float
+        Distance (in inches) to shift center along mirror normal toward origin.
+        Default = 0.045. Set to 0 for mirrors that do not require shift.
     """
 
     # --------------------------
-    # 0. Shift center along normal toward origin
+    # 0. Shift center along normal toward origin (if shift_dist > 0)
     # --------------------------
     theta = np.radians(theta_deg)
     center = np.array([float(x), float(y), float(z)])
@@ -825,20 +835,17 @@ def get_mount_corners(x, y, z, theta_deg):
 
     # Normal to mirror face (perpendicular in x-y plane)
     n = np.array([-np.sin(theta), np.cos(theta), 0.0])
-    n = n / np.linalg.norm(n)  # normalize
+    n = n / np.linalg.norm(n)
 
-    # Determine which direction points toward origin
-    if np.linalg.norm(center - 0.045*n) < np.linalg.norm(center + 0.045*n):
-        center_shifted = center - 0.045*n
-    else:
-        center_shifted = center + 0.045*n
-
-    center = center_shifted
+    if shift_dist != 0:
+        if np.linalg.norm(center - shift_dist*n) < np.linalg.norm(center + shift_dist*n):
+            center = center - shift_dist*n
+        else:
+            center = center + shift_dist*n
 
     # --------------------------
     # 1. Define mirror geometry
     # --------------------------
-    s_half = 1.3 / 2
     v = np.array([0.0, 0.0, 1.0])
 
     corners = [
@@ -886,21 +893,41 @@ def sim_to_px_reflec(x, y): # For reflection points
     pixel_point = world_to_pixel(sim_M_IRL[0], sim_M_IRL[1], lsr_height)
     return pixel_point
 
-def sim_to_px(x, y, a): # For ArUcos
+def sim_to_px(x, y, a, mirror_id):  # For ArUcos
     sim_M_IRL = sim_to_pt(x, y)
-    sim_M_corners = get_mount_corners(sim_M_IRL[0], sim_M_IRL[1], lsr_height, a)
-    sim_M_corner_1 = world_to_pixel(sim_M_corners[0][0], sim_M_corners[0][1], sim_M_corners[0][2])
-    sim_M_corner_2 = world_to_pixel(sim_M_corners[1][0], sim_M_corners[1][1], sim_M_corners[1][2])
-    sim_M_corner_3 = world_to_pixel(sim_M_corners[2][0], sim_M_corners[2][1], sim_M_corners[2][2])
+
+    Xw = sim_M_IRL[0]
+    Yw = sim_M_IRL[1]
+
+    # -----------------------------------
+    # Mirror-specific geometry selection
+    # -----------------------------------
+    if mirror_id == 4:
+        s_half = 1.49 / 2
+        shift_dist = 0.0
+    else:
+        s_half = 1.3 / 2
+        shift_dist = 0.045
+
+    sim_M_corners = get_mount_corners(
+        Xw, Yw, lsr_height, a,
+        s_half=s_half,
+        shift_dist=shift_dist
+    )
+
+    sim_M_corner_1 = world_to_pixel(*sim_M_corners[0])
+    sim_M_corner_2 = world_to_pixel(*sim_M_corners[1])
+    sim_M_corner_3 = world_to_pixel(*sim_M_corners[2])
+
     return sim_M_corner_1, sim_M_corner_2, sim_M_corner_3
 
 def aruco_pixel_residuals(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a, img_path):
     # ArUcos:
     camera_aruco_coords = camera_arucos(img_path)
-    M1_px = sim_to_px(M1x, M1y, M1a)
-    M2_px = sim_to_px(M2x, M2y, M2a)
-    M3_px = sim_to_px(M3x, M3y, M3a)
-    M4_px = sim_to_px(M4x, M4y, M4a)
+    M1_px = sim_to_px(M1x, M1y, M1a, mirror_id=1)
+    M2_px = sim_to_px(M2x, M2y, M2a, mirror_id=2)
+    M3_px = sim_to_px(M3x, M3y, M3a, mirror_id=3)
+    M4_px = sim_to_px(M4x, M4y, M4a, mirror_id=4)
     M_all_px = np.array([M1_px, M2_px, M3_px, M4_px]).reshape(-1, 2)
     distances = np.linalg.norm(M_all_px - camera_aruco_coords, axis=1)
     return distances
@@ -1004,19 +1031,17 @@ def group_aruco_centers_by_mirror(centers12):
             out[m].append(p)
     return out
 
-
 def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
     """
     Uses sim.sim_to_px(...) which returns 3 pixel points per mirror (mount corners).
     NOTE: uses fixed y values from Simulation.py (sim.M1y, sim.M2y, ...)
     """
     return {
-        "M1": list(sim_to_px(M1x, M1y, M1a)),
-        "M2": list(sim_to_px(M2x, M2y, M2a)),
-        "M3": list(sim_to_px(M3x, M3y, M3a)),
-        "M4": list(sim_to_px(M4x, M4y, M4a)),
+        "M1": list(sim_to_px(M1x, M1y, M1a, mirror_id=1)),
+        "M2": list(sim_to_px(M2x, M2y, M2a, mirror_id=2)),
+        "M3": list(sim_to_px(M3x, M3y, M3a, mirror_id=3)),
+        "M4": list(sim_to_px(M4x, M4y, M4a, mirror_id=4)),
     }
-
 
 def sim_reflection_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
     """

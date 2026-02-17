@@ -4,13 +4,22 @@ import numpy as np
 import cv2 as cv
 import json
 import math
-from hole_data import hole_data, post_hole_data
 from dataclasses import dataclass
 from sklearn.cluster import DBSCAN
 from scipy.optimize import least_squares
 from scipy.optimize import minimize
-from intrinsics_transition import R_wc, t_wc, rvec_cw, tvec_cw, K, D
-from roi_config import rois
+with open("roi_config.json", "r") as f:
+    rois = json.load(f)
+
+with open("intrinsics_transition.json", "r") as f:
+    camera_calib_data = json.load(f)
+
+R_wc = np.array(camera_calib_data["R_wc"])
+t_wc = np.array(camera_calib_data["t_wc"])
+rvec_cw = np.array(camera_calib_data["rvec_cw"])
+tvec_cw = np.array(camera_calib_data["tvec_cw"])
+K = np.array(camera_calib_data["K"])
+D = np.array(camera_calib_data["D"])
 
 # The diameter of usable mirror. Given 1 inch mirror: 25.4mm. Clear aperture from spec sheet: 22.9mm.
 # 3mm diameter beam. 22.9 - (3/2) = 21.4 mm
@@ -29,13 +38,13 @@ THRESHOLD = 180
 lsr_height = 4.087 # inches
 
 EXIT_TARGET = -0.265    # aligned exit angle
-SIGMA_PX = 2.0          # px (tune)
-SIGMA_EXIT = 0.02       # units of simulation_identifier (tune)
-SIGMA_REFL = 3.0        # px (tune)
+SIGMA_PX = 3.5          # px (tune)
+SIGMA_EXIT = 200       # units of simulation_identifier (tune)
+SIGMA_REFL = 3.5        # px (tune)
 
 BIG_PEN = 50.0     # px penalty converted to residual via /SIGMA_REFL
 
-M1y, M2y, M3y, M4y = 109, 75, 71, 117 # simulation units (mm)
+M1y, M2y, M3y, M4y = 109, 73, 69, 120 # simulation units (mm)
 
 # Function to calculate the endpoints of a mirror given center, length, and angle
 def calculate_mirror_endpoints(center, length, angle):
@@ -424,9 +433,12 @@ def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m
 
 def pixel_to_world_on_plane(u, v, H_in=0.0, override_cam_height=None):
     pts = np.array([[[u, v]]], dtype=np.float64)
-    rays_norm = cv.undistortPoints(pts, K, D)  # pinhole model
+    rays_norm = cv.fisheye.undistortPoints(pts, K, D)  # pinhole model
     x, y = rays_norm[0,0]
     d_cam = np.array([x, y, 1.0], dtype=np.float64)
+
+    # normalize direction
+    d_cam /= np.linalg.norm(d_cam)
 
     d_w = R_wc @ d_cam
 
@@ -440,7 +452,7 @@ def pixel_to_world_on_plane(u, v, H_in=0.0, override_cam_height=None):
 
 def world_to_pixel(X, Y, Z):
     obj = np.array([[[X, Y, Z]]], dtype=np.float64)  # (1,1,3)
-    img_proj, _ = cv.projectPoints(obj, rvec_cw, tvec_cw, K, D)
+    img_proj, _ = cv.fisheye.projectPoints(obj, rvec_cw, tvec_cw, K, D)
     u, v = img_proj.reshape(2)
     return float(u), float(v)
 
@@ -919,9 +931,7 @@ def refl_residuals_fixedK(meas_pts, sim_pts, K, sigma=SIGMA_REFL, big_pen=BIG_PE
 
     return np.concatenate([r_match, r_count])
 
-def residuals(theta, img_path_light, img_path_dark, K_by_mirror):
-    img_dark = cv.imread(img_path_dark)
-    img_gray = cv.cvtColor(img_dark, cv.COLOR_BGR2GRAY)
+def residuals(theta, img_path_light, K_by_mirror, reflec_cam):
     
     M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a = theta
     # ---- ArUco pixel residuals ----
@@ -956,9 +966,6 @@ def residuals(theta, img_path_light, img_path_dark, K_by_mirror):
         if len(refl_sim_px_grouped[name]) == 0:
             print(f"[WARN] No SIM reflections in {name}")
 
-    # Reflec points from cam
-    reflec_cam = reflec_pts_cam(img_gray, show = False)
-
     r_refl = []
     for name in rois.keys():
         r_refl.append(
@@ -977,3 +984,147 @@ def residuals(theta, img_path_light, img_path_dark, K_by_mirror):
 
     # Stack everything
     return np.concatenate([r_aruco, r_exit_angle, r_exit_height, r_refl_pts])
+
+def group_aruco_centers_by_mirror(centers12):
+    """
+    centers12: list of 12 (x,y) points sorted by ArUco ID (0..11)
+    Assumes 3 per mirror in order: M1(0-2), M2(3-5), M3(6-8), M4(9-11)
+    """
+    centers12 = list(centers12) if centers12 is not None else []
+    out = {"M1": [], "M2": [], "M3": [], "M4": []}
+    if len(centers12) >= 12:
+        out["M1"] = centers12[0:3]
+        out["M2"] = centers12[3:6]
+        out["M3"] = centers12[6:9]
+        out["M4"] = centers12[9:12]
+    else:
+        # graceful fallback
+        for i, p in enumerate(centers12):
+            m = ["M1","M2","M3","M4"][min(i//3, 3)]
+            out[m].append(p)
+    return out
+
+
+def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
+    """
+    Uses sim.sim_to_px(...) which returns 3 pixel points per mirror (mount corners).
+    NOTE: uses fixed y values from Simulation.py (sim.M1y, sim.M2y, ...)
+    """
+    return {
+        "M1": list(sim_to_px(M1x, M1y, M1a)),
+        "M2": list(sim_to_px(M2x, M2y, M2a)),
+        "M3": list(sim_to_px(M3x, M3y, M3a)),
+        "M4": list(sim_to_px(M4x, M4y, M4a)),
+    }
+
+
+def sim_reflection_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
+    """
+    Mimics residuals(): simulation_reflec -> take [1:-1] -> world->pixel -> group into ROI dict.
+    """
+    path = simulation_reflec(
+        M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y,
+        M1a, M2a, M3a, M4a
+    )
+
+    world_pts = path[1:-1]  # drop start + final "exit" point (same as residuals)
+    px_pts = []
+    for (xw, yw) in world_pts:
+        u, v = sim_to_px_reflec(xw, yw)
+        px_pts.append([float(u), float(v)])
+
+    grouped = {k: [] for k in rois.keys()}
+    for u, v in px_pts:
+        for name, (x0, y0, x1, y1) in rois.items():
+            if x0 <= u <= x1 and y0 <= v <= y1:
+                grouped[name].append([u, v])
+                break
+    return grouped
+
+
+def overlay_reflections_and_aruco(
+    img_bgr,
+    reflec_meas_by_mirror=None,
+    aruco_meas_by_mirror=None,
+    reflec_sim_by_mirror=None,
+    aruco_sim_by_mirror=None,
+    title="ArUcos + Reflections Overlay",
+):
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.imshow(cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB))
+    ax.set_title(title)
+    ax.set_xlabel("x [px]")
+    ax.set_ylabel("y [px]")
+
+    mirror_colors = {"M1": "cyan", "M2": "yellow", "M3": "lime", "M4": "magenta"}
+
+    # --- measured reflections (red open circles) ---
+    if reflec_meas_by_mirror:
+        all_meas = []
+        for pts in reflec_meas_by_mirror.values():
+            for p in pts:
+                all_meas.append((float(p[0]), float(p[1])))
+        if all_meas:
+            rx, ry = zip(*all_meas)
+            ax.scatter(rx, ry, s=120, facecolors="none", edgecolors="red",
+                       linewidths=2, label="Reflections (measured)")
+
+    # --- simulated reflections (red x) ---
+    if reflec_sim_by_mirror:
+        all_sim = []
+        for pts in reflec_sim_by_mirror.values():
+            for p in pts:
+                all_sim.append((float(p[0]), float(p[1])))
+        if all_sim:
+            sx, sy = zip(*all_sim)
+            ax.scatter(sx, sy, s=90, marker="x", linewidths=2,
+                       c="red", label="Reflections (sim)")
+
+    # --- measured arucos (colored +) ---
+    if aruco_meas_by_mirror:
+        for mname, pts in aruco_meas_by_mirror.items():
+            if not pts:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.scatter(xs, ys, marker="+", s=260, linewidths=3,
+                       c=mirror_colors.get(mname, "white"),
+                       label=f"{mname} ArUco (measured)")
+
+    # --- simulated arucos (colored dots) ---
+    if aruco_sim_by_mirror:
+        for mname, pts in aruco_sim_by_mirror.items():
+            if not pts:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.scatter(xs, ys, marker="o", s=45,
+                       c=mirror_colors.get(mname, "white"),
+                       label=f"{mname} ArUco (sim)")
+
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 0.02), ncol=3, framealpha=0.9)
+    ax.set_xlim(0, img_bgr.shape[1])
+    ax.set_ylim(img_bgr.shape[0], 0)  # image coords (origin top-left)
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
+
+def group_aruco_centers_by_mirror(centers12):
+    """
+    centers12: list of 12 (x,y) points sorted by ArUco ID (0..11)
+    Assumes 3 per mirror in order: M1(0-2), M2(3-5), M3(6-8), M4(9-11)
+    """
+    centers12 = list(centers12) if centers12 is not None else []
+    out = {"M1": [], "M2": [], "M3": [], "M4": []}
+
+    if len(centers12) >= 12:
+        out["M1"] = centers12[0:3]
+        out["M2"] = centers12[3:6]
+        out["M3"] = centers12[6:9]
+        out["M4"] = centers12[9:12]
+    else:
+        for i, p in enumerate(centers12):
+            m = ["M1", "M2", "M3", "M4"][min(i // 3, 3)]
+            out[m].append(p)
+
+    return out

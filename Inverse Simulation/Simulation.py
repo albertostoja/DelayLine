@@ -136,6 +136,7 @@ def calculate_distance(p1, p2):
     return np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
 
 # Simulate laser reflections with length calculation
+# Gives us the laser path and total laser length
 def simulate_laser_with_length(laser_start, laser_angle, mirrors, max_reflections=36):
     current_position = laser_start
     current_angle = laser_angle
@@ -431,6 +432,7 @@ def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m
 
 # TRANSITION FUNCTIONS
 
+# Given a pixel coordinate and its known height (u,v,H_in), this function returns the real-life coordinates (inches)
 def pixel_to_world_on_plane(u, v, H_in=0.0, override_cam_height=None):
     pts = np.array([[[u, v]]], dtype=np.float64)
     rays_norm = cv.fisheye.undistortPoints(pts, K, D)  # pinhole model
@@ -450,6 +452,8 @@ def pixel_to_world_on_plane(u, v, H_in=0.0, override_cam_height=None):
     Pw = C_w + lam * d_w
     return float(Pw[0]), float(Pw[1])
 
+# This is the opposite of pixel_to_world_on_plane.
+# Given a real-life coordinate point (inches), this function returns the corresponding pixel coordinate
 def world_to_pixel(X, Y, Z):
     obj = np.array([[[X, Y, Z]]], dtype=np.float64)  # (1,1,3)
     img_proj, _ = cv.fisheye.projectPoints(obj, rvec_cw, tvec_cw, K, D)
@@ -458,6 +462,7 @@ def world_to_pixel(X, Y, Z):
 
 # ArUcos
 
+# Returns the pixel coordinates of the detected ArUco points
 def camera_arucos(img_path):
     # --- Config ---
     dict_name = "DICT_4X4_100"
@@ -521,6 +526,7 @@ def camera_arucos(img_path):
 
 # LASER REFLECTION POINTS
 
+# Performs Principal Component Analysis (PCA) to distinguish laser reflection points that are elliptical
 def pca_elongation(points_xy):
     """
     points_xy: (N,2) array of [x,y] in patch coords.
@@ -886,7 +892,7 @@ def get_mount_corners(x, y, z, theta_deg,
 
     return [out1, out2, out3]
 
-# THE PROCESS
+# THE OPTIMIZATION PROCESS
 
 def sim_to_px_reflec(x, y): # For reflection points
     sim_M_IRL = sim_to_pt(x, y)
@@ -958,6 +964,7 @@ def refl_residuals_fixedK(meas_pts, sim_pts, K, sigma=SIGMA_REFL, big_pen=BIG_PE
 
     return np.concatenate([r_match, r_count])
 
+# The residuals (differences) between the measured and simulated components (ArUcos, Reflection points, ...)
 def residuals(theta, img_path_light, K_by_mirror, reflec_cam):
     
     M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a = theta
@@ -1011,6 +1018,8 @@ def residuals(theta, img_path_light, K_by_mirror, reflec_cam):
 
     # Stack everything
     return np.concatenate([r_aruco, r_exit_angle, r_exit_height, r_refl_pts])
+
+# OVERLAYING SIMULATED MEASUREMENTS OVER THE ACTUAL MEASUREMENTS
 
 def group_aruco_centers_by_mirror(centers12):
     """

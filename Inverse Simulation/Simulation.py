@@ -33,14 +33,16 @@ laser_angle = 0  # Initial laser angle in degrees
 qc_1 = np.array([-100, 137])
 qc_2 = np.array([-300, 190])
 
-THRESHOLD = 180
+THRESHOLD = 200     # Pixel intensity threshold for reflection point detection
+EPS = 7.0           # DBSCAN groups pixels that are within EPS pixels of each other
+MIN_SEP = 15        # minimum separation threshold to separate an ambiguous refl pt into two refl pts
 
 lsr_height = 4.087 # inches
 
 EXIT_TARGET = -0.265    # aligned exit angle
-SIGMA_PX = 3.5          # px (tune)
+SIGMA_PX = 200          # px (tune)
 SIGMA_EXIT = 200       # units of simulation_identifier (tune)
-SIGMA_REFL = 3.5        # px (tune)
+SIGMA_REFL = 2        # px (tune)
 
 BIG_PEN = 50.0     # px penalty converted to residual via /SIGMA_REFL
 
@@ -428,7 +430,7 @@ def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m
     print(f"y300: {y300-190}")
     print(f"y525: {y525-249.63}")
 
-    return exit_slope, total_length + distance, y100-137, y300-190
+    return exit_slope, total_length + distance, y100-137, y300-190, y525-249.63
 
 # TRANSITION FUNCTIONS
 
@@ -570,7 +572,7 @@ def split_cluster_k2(points_xy, n_iter=20):
 
     return np.vstack([c1, c2])
 
-def postprocess_split_peanuts(clusters, radius_split=18.0, elong_split=1.8, min_sep=6.0):
+def postprocess_split_peanuts(clusters, radius_split=50.0, elong_split=5, min_sep=MIN_SEP):
     """
     Splits clusters that look like two touching spots.
     Returns a new cluster list (some clusters replaced by two subclusters).
@@ -591,6 +593,8 @@ def postprocess_split_peanuts(clusters, radius_split=18.0, elong_split=1.8, min_
             centers2 = split_cluster_k2(pts)
 
             # reject split if the two centers are basically on top of each other
+            dcent = np.linalg.norm(centers2[0] - centers2[1])
+            print("split candidate center distance:", dcent, "min_sep:", min_sep)
             if np.linalg.norm(centers2[0] - centers2[1]) < min_sep:
                 new_clusters.append(c)
                 continue
@@ -629,7 +633,7 @@ def postprocess_split_peanuts(clusters, radius_split=18.0, elong_split=1.8, min_
     new_clusters.sort(key=lambda x: x["size"], reverse=True)
     return new_clusters
 
-def find_clusters_with_circles(patch, threshold=200, eps=5.0, min_samples=35, show=True, title=""):
+def find_clusters_with_circles(patch, threshold=THRESHOLD, eps=EPS, min_samples=50, show=True, title=""):
     y_coords, x_coords = np.where(patch > threshold)
 
     if len(x_coords) == 0:
@@ -670,7 +674,7 @@ def find_clusters_with_circles(patch, threshold=200, eps=5.0, min_samples=35, sh
 
     clusters.sort(key=lambda x: x['size'], reverse=True)
 
-    clusters = postprocess_split_peanuts(clusters, radius_split=20.0, elong_split=2, min_sep=8.0)
+    clusters = postprocess_split_peanuts(clusters, radius_split=30.0, elong_split=2, min_sep=MIN_SEP)
 
     if show:
         fig, axes = plt.subplots(1, 2, figsize=(14, 7))
@@ -712,7 +716,7 @@ def find_clusters_with_circles(patch, threshold=200, eps=5.0, min_samples=35, sh
     return clusters
 
 
-def clusters_in_roi(gray, roi, threshold=200, eps=5.0, min_samples=35, show=True):
+def clusters_in_roi(gray, roi, threshold=THRESHOLD, eps=EPS, min_samples=35, show=True):
     x1, y1, x2, y2 = roi
     patch = gray[y1:y2, x1:x2]
 
@@ -728,7 +732,7 @@ def clusters_in_roi(gray, roi, threshold=200, eps=5.0, min_samples=35, show=True
 
     return clusters
 
-def process_all_rois(gray_img, rois, threshold, eps=5.0, min_samples=35, show=False):
+def process_all_rois(gray_img, rois, threshold, eps=EPS, min_samples=35, show=False):
     results = {}
     for name, roi in rois.items():
         clusters = clusters_in_roi(
@@ -741,7 +745,7 @@ def process_all_rois(gray_img, rois, threshold, eps=5.0, min_samples=35, show=Fa
         results[name] = clusters
     return results
 
-def reflec_pts_cam(gray_img, eps=5.0, min_samples=35, show=False):
+def reflec_pts_cam(gray_img, eps=EPS, min_samples=35, show=False):
     all_clusters = process_all_rois(
         gray_img,
         rois=rois,
@@ -928,13 +932,23 @@ def sim_to_px(x, y, a, mirror_id):  # For ArUcos
     return sim_M_corner_1, sim_M_corner_2, sim_M_corner_3
 
 def aruco_pixel_residuals(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a, img_path):
-    # ArUcos:
-    camera_aruco_coords = camera_arucos(img_path)
+    # ---- cache camera ArUco detection by image path ----
+    if not hasattr(aruco_pixel_residuals, "_aruco_cache"):
+        aruco_pixel_residuals._aruco_cache = {}
+
+    if img_path not in aruco_pixel_residuals._aruco_cache:
+        aruco_pixel_residuals._aruco_cache[img_path] = camera_arucos(img_path)
+
+    camera_aruco_coords = aruco_pixel_residuals._aruco_cache[img_path]
+    # ----------------------------------------------------
+
     M1_px = sim_to_px(M1x, M1y, M1a, mirror_id=1)
     M2_px = sim_to_px(M2x, M2y, M2a, mirror_id=2)
     M3_px = sim_to_px(M3x, M3y, M3a, mirror_id=3)
     M4_px = sim_to_px(M4x, M4y, M4a, mirror_id=4)
+
     M_all_px = np.array([M1_px, M2_px, M3_px, M4_px]).reshape(-1, 2)
+
     distances = np.linalg.norm(M_all_px - camera_aruco_coords, axis=1)
     return distances
 

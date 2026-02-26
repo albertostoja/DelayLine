@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from sklearn.cluster import DBSCAN
 from scipy.optimize import least_squares
 from scipy.optimize import minimize
+from scipy.optimize import linear_sum_assignment
 with open("roi_config.json", "r") as f:
     rois = json.load(f)
 
@@ -40,13 +41,13 @@ MIN_SEP = 15        # minimum separation threshold to separate an ambiguous refl
 lsr_height = 4.087 # inches
 
 EXIT_TARGET = -0.265    # aligned exit angle
-SIGMA_PX = 200          # px (tune)
-SIGMA_EXIT = 200       # units of simulation_identifier (tune)
-SIGMA_REFL = 2        # px (tune)
+SIGMA_PX = 3            # px (tune)
+SIGMA_EXIT = 8          # units of simulation_identifier (tune)
+SIGMA_REFL = 3          # px (tune)
 
 BIG_PEN = 50.0     # px penalty converted to residual via /SIGMA_REFL
 
-M1y, M2y, M3y, M4y = 109, 73, 69, 120 # simulation units (mm)
+# M1y, M2y, M3y, M4y = 109, 73, 69, 120 # simulation units (mm)
 
 # Function to calculate the endpoints of a mirror given center, length, and angle
 def calculate_mirror_endpoints(center, length, angle):
@@ -931,7 +932,7 @@ def sim_to_px(x, y, a, mirror_id):  # For ArUcos
 
     return sim_M_corner_1, sim_M_corner_2, sim_M_corner_3
 
-def aruco_pixel_residuals(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a, img_path):
+def aruco_pixel_residuals(theta, img_path):
     # ---- cache camera ArUco detection by image path ----
     if not hasattr(aruco_pixel_residuals, "_aruco_cache"):
         aruco_pixel_residuals._aruco_cache = {}
@@ -942,6 +943,8 @@ def aruco_pixel_residuals(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a, img_path):
     camera_aruco_coords = aruco_pixel_residuals._aruco_cache[img_path]
     # ----------------------------------------------------
 
+    M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a = theta
+
     M1_px = sim_to_px(M1x, M1y, M1a, mirror_id=1)
     M2_px = sim_to_px(M2x, M2y, M2a, mirror_id=2)
     M3_px = sim_to_px(M3x, M3y, M3a, mirror_id=3)
@@ -949,42 +952,44 @@ def aruco_pixel_residuals(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a, img_path):
 
     M_all_px = np.array([M1_px, M2_px, M3_px, M4_px]).reshape(-1, 2)
 
-    distances = np.linalg.norm(M_all_px - camera_aruco_coords, axis=1)
-    return distances
+    residuals = (M_all_px - camera_aruco_coords).reshape(-1)
+    return residuals
 
 def refl_residuals_fixedK(meas_pts, sim_pts, K, sigma=SIGMA_REFL, big_pen=BIG_PEN):
+
     meas = np.asarray(meas_pts, float).reshape(-1, 2)
     sim  = np.asarray(sim_pts,  float).reshape(-1, 2)
 
-    # 1) geometric matching residuals: one per measured point (K of them, fixed)
-    # (meas count should already be == K by construction)
     if K == 0:
         r_match = np.array([], dtype=float)
+
     elif sim.size == 0:
         r_match = np.full((K,), big_pen / sigma, dtype=float)
+
     else:
         dists = np.linalg.norm(meas[:, None, :] - sim[None, :, :], axis=2)
-        dmin = dists.min(axis=1)  # length K
-        r_match = dmin / sigma
 
-    # 2) count penalty: enforce sim count ~= K
+        row_ind, col_ind = linear_sum_assignment(dists)
+
+        r_match = dists[row_ind, col_ind] / sigma
+
+    # Count penalty (still discontinuous — you said you'll fix later)
     n_sim = sim.shape[0] if sim.size else 0
     missing = max(0, K - n_sim)
     extra   = max(0, n_sim - K)
 
-    # add one residual per missing/extra reflection (fixed count if K is fixed)
-    # If you want strictly fixed length, encode count penalty as TWO scalars:
-    r_count = np.array([missing * (big_pen / sigma), extra * (big_pen / sigma)], dtype=float)
+    r_count = np.array([missing * (big_pen / sigma),
+                        extra   * (big_pen / sigma)], dtype=float)
 
     return np.concatenate([r_match, r_count])
 
 # The residuals (differences) between the measured and simulated components (ArUcos, Reflection points, ...)
 def residuals(theta, img_path_light, K_by_mirror, reflec_cam):
     
-    M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a = theta
+    M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a = theta
     # ---- ArUco pixel residuals ----
     # big_equation should return a 1D array of pixel residuals: [du1, dv1, du2, dv2, ...]
-    r_aruco_px = aruco_pixel_residuals(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a, img_path_light)
+    r_aruco_px = aruco_pixel_residuals(theta, img_path_light)
 
     # Normalize by expected pixel noise
     r_aruco = r_aruco_px / SIGMA_PX
@@ -1054,7 +1059,7 @@ def group_aruco_centers_by_mirror(centers12):
             out[m].append(p)
     return out
 
-def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
+def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a):
     """
     Uses sim.sim_to_px(...) which returns 3 pixel points per mirror (mount corners).
     NOTE: uses fixed y values from Simulation.py (sim.M1y, sim.M2y, ...)
@@ -1066,7 +1071,7 @@ def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
         "M4": list(sim_to_px(M4x, M4y, M4a, mirror_id=4)),
     }
 
-def sim_reflection_pts_by_mirror(M1x, M2x, M3x, M4x, M1a, M2a, M3a, M4a):
+def sim_reflection_pts_by_mirror(M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a):
     """
     Mimics residuals(): simulation_reflec -> take [1:-1] -> world->pixel -> group into ROI dict.
     """

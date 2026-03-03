@@ -420,18 +420,18 @@ def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m
     last_two = laser_path[-2:]
     exit_slope = (last_two[1][1]-last_two[0][1])/(last_two[1][0]-last_two[0][0])
     y_int=last_two[1][1]-exit_slope*last_two[1][0]
-    y100=exit_slope*-100+y_int
+    y191=exit_slope*-191+y_int
     y200=exit_slope*-200+y_int
     y300=exit_slope*-300+y_int
-    y525=exit_slope*-525+y_int
+    y595=exit_slope*-595+y_int
     print(f"Exit angle: {exit_slope}")
     print(f"Total length: {total_length + distance}")
-    print(f"y100: {y100-137}")
+    print(f"y191: {y191-160}")
     print(f"y200: {y200-163.5}")
     print(f"y300: {y300-190}")
-    print(f"y525: {y525-249.63}")
+    print(f"y595: {y595-268.3}")
 
-    return exit_slope, total_length + distance, y100-137, y300-190, y525-249.63
+    return exit_slope, total_length + distance, y191-160, y300-190, y595-268.3
 
 # TRANSITION FUNCTIONS
 
@@ -1133,29 +1133,35 @@ def overlay_reflections_and_aruco(
             ax.scatter(sx, sy, s=90, marker="x", linewidths=2,
                        c="red", label="Reflections (sim)")
 
-    # --- measured arucos (colored +) ---
+    # --- measured arucos (colored square) ---
     if aruco_meas_by_mirror:
         for mname, pts in aruco_meas_by_mirror.items():
             if not pts:
                 continue
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            ax.scatter(xs, ys, marker="+", s=260, linewidths=3,
-                       c=mirror_colors.get(mname, "white"),
-                       label=f"{mname} ArUco (measured)")
+            ax.scatter(
+                xs, ys,
+                marker="s",
+                s=260,
+                linewidths=3,
+                facecolors='none',   # hollow
+                edgecolors=mirror_colors.get(mname, "white"),
+                label=f"{mname} ArUco (measured)"
+            )
 
-    # --- simulated arucos (colored dots) ---
+    # --- simulated arucos (colored x) ---
     if aruco_sim_by_mirror:
         for mname, pts in aruco_sim_by_mirror.items():
             if not pts:
                 continue
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            ax.scatter(xs, ys, marker="o", s=45,
+            ax.scatter(xs, ys, marker="x", s=90, linewidths=2,
                        c=mirror_colors.get(mname, "white"),
                        label=f"{mname} ArUco (sim)")
 
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 0.02), ncol=3, framealpha=0.9)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 0.02), ncol=2, labelspacing=1., framealpha=0.9)
     ax.set_xlim(0, img_bgr.shape[1])
     ax.set_ylim(img_bgr.shape[0], 0)  # image coords (origin top-left)
     plt.tight_layout()

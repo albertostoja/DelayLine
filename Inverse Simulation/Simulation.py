@@ -65,74 +65,75 @@ def calculate_mirror_endpoints(center, length, angle):
 
 # Function to find the intersection of two lines
 def find_intersection(p1, p2, p3, p4, eps=1e-9):
-    # Laser direction (t parameter)
     x1, y1 = p1
     x2, y2 = p2
     x3, y3 = p3
     x4, y4 = p4
 
-    r = np.array([x2 - x1, y2 - y1], dtype=float)  # laser direction
-    s = np.array([x4 - x3, y4 - y3], dtype=float)  # mirror direction
+    r = np.array([x2 - x1, y2 - y1], dtype=float)
+    s = np.array([x4 - x3, y4 - y3], dtype=float)
 
     rxs = r[0]*s[1] - r[1]*s[0]
     if abs(rxs) < eps:
-        return None  # parallel / nearly parallel
+        return None  # parallel
 
     qp = np.array([x3 - x1, y3 - y1], dtype=float)
 
-    # Solve p1 + t r = p3 + u s
     t = (qp[0]*s[1] - qp[1]*s[0]) / rxs
     u = (qp[0]*r[1] - qp[1]*r[0]) / rxs
 
-    # Mirror segment constraint: u in [0, 1]
-    # Laser ray constraint: t >= 0 (in front of start)
-    if t >= -eps and -eps <= u <= 1 + eps:
-        return (x1 + t*r[0], y1 + t*r[1])
+    if t >= -eps:
+        return (x1 + t*r[0], y1 + t*r[1]), u
 
     return None
 
 # Function to calculate the reflection of a laser beam
-def reflect_laser(laser_start, laser_angle, mirrors, last_mirror):
+# This is used for the optimization
+def reflect_laser_ordered(laser_start, laser_angle, mirror):
     laser_angle_rad = np.radians(laser_angle)
     laser_far_end = (
         laser_start[0] + np.cos(laser_angle_rad) * 1000,
         laser_start[1] + np.sin(laser_angle_rad) * 1000,
     )
-    
-    closest_intersection = None
-    closest_mirror = None
-    min_distance = float('inf')
 
-    # Find the closest intersection, ignoring the last mirror hit
-    for mirror in mirrors:
-        if mirror == last_mirror:
-            continue
-        intersection = find_intersection(laser_start, laser_far_end, mirror[0], mirror[1])
-        if intersection is not None:
-            distance = np.linalg.norm(np.array(intersection) - np.array(laser_start))
-            if distance < min_distance:
-                min_distance = distance
-                closest_intersection = intersection
-                closest_mirror = mirror
+    mirror_start, mirror_end = mirror
 
-    if closest_intersection is None:
-        return None, None, None  # No reflection
-    
-    # Reflection calculation
-    mirror_start, mirror_end = closest_mirror
-    mirror_vector = np.array([mirror_end[0] - mirror_start[0], mirror_end[1] - mirror_start[1]])
-    mirror_length = np.linalg.norm(mirror_vector)
-    mirror_unit_vector = mirror_vector / mirror_length
-    normal_vector = np.array([-mirror_unit_vector[1], mirror_unit_vector[0]])
-    incident_vector = np.array([closest_intersection[0] - laser_start[0], closest_intersection[1] - laser_start[1]])
+    result = find_intersection(
+        laser_start, laser_far_end,
+        mirror_start, mirror_end
+    )
+
+    if result is None:
+        return None, None, False
+
+    intersection, u = result
+
+    # Determine if inside segment
+    inside = (0 <= u <= 1)
+
+    # Reflection math (same as your original)
+    mirror_vector = np.array([
+        mirror_end[0] - mirror_start[0],
+        mirror_end[1] - mirror_start[1]
+    ])
+    mirror_unit = mirror_vector / np.linalg.norm(mirror_vector)
+    normal_vector = np.array([-mirror_unit[1], mirror_unit[0]])
+
+    incident_vector = np.array([
+        intersection[0] - laser_start[0],
+        intersection[1] - laser_start[1]
+    ])
+
     reflection_vector = (
         incident_vector - 2 * np.dot(incident_vector, normal_vector) * normal_vector
     )
+
     reflected_end = (
-        closest_intersection[0] + reflection_vector[0],
-        closest_intersection[1] + reflection_vector[1],
+        intersection[0] + reflection_vector[0],
+        intersection[1] + reflection_vector[1]
     )
-    return closest_intersection, reflected_end, closest_mirror
+
+    return intersection, reflected_end, inside
 
 # Function to calculate distance between two points
 def calculate_distance(p1, p2):
@@ -140,34 +141,56 @@ def calculate_distance(p1, p2):
 
 # Simulate laser reflections with length calculation
 # Gives us the laser path and total laser length
-def simulate_laser_with_length(laser_start, laser_angle, mirrors, max_reflections=36):
+def simulate_laser_with_length(laser_start, laser_angle, mirrors, max_reflections=36, exit_dist=1000):
     current_position = laser_start
     current_angle = laser_angle
-    last_mirror = None
-    laser_path = [laser_start]  # Track laser path
+    laser_path = [laser_start]
+
+    mirror_index = 0  # M1 first
 
     for _ in range(max_reflections):
-        intersection, reflected_end, hit_mirror = reflect_laser(current_position, current_angle, mirrors, last_mirror)
+        intersection, reflected_end, inside = reflect_laser_ordered(
+            current_position,
+            current_angle,
+            mirrors[mirror_index]
+        )
+
+        # If no intersection with mirror line (rare degeneracy): exit
         if intersection is None:
-            # No more intersections; add final endpoint and break
             laser_far_end = (
-                current_position[0] + np.cos(np.radians(current_angle)) * 1000,
-                current_position[1] + np.sin(np.radians(current_angle)) * 1000,
+                current_position[0] + np.cos(np.radians(current_angle)) * exit_dist,
+                current_position[1] + np.sin(np.radians(current_angle)) * exit_dist,
             )
             laser_path.append(laser_far_end)
             break
 
-        # Update the path and continue simulation
+        # If it intersects the infinite line but misses the segment: exit (do NOT append intersection)
+        if not inside:
+            laser_far_end = (
+                current_position[0] + np.cos(np.radians(current_angle)) * exit_dist,
+                current_position[1] + np.sin(np.radians(current_angle)) * exit_dist,
+            )
+            laser_path.append(laser_far_end)
+            break
+
+        # Otherwise: valid reflection, keep it
         laser_path.append(intersection)
+
+        # Update ray
         current_position = intersection
         current_angle = np.degrees(np.arctan2(
             reflected_end[1] - intersection[1],
             reflected_end[0] - intersection[0],
         ))
-        last_mirror = hit_mirror
 
-    # Calculate total laser length
-    total_length = sum(calculate_distance(laser_path[i], laser_path[i + 1]) for i in range(len(laser_path) - 2))
+        mirror_index = (mirror_index + 1) % len(mirrors)
+
+    # Total path length (sum all segments in laser_path)
+    total_length = sum(
+        calculate_distance(laser_path[i], laser_path[i + 1])
+        for i in range(len(laser_path) - 1)
+    )
+
     return laser_path, total_length
 
 def extend_line(p1, p2):
@@ -229,11 +252,12 @@ def process_mirrors(mirrors):
     return doubled_lines, orthogonal_lines
 
 def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
+
     mirrors = []
 
     # MIRROR CONFIGURATION
     mirror_centers = [(m1cx, m1cy), (m2cx, m2cy), (m3cx, m3cy), (m4cx, m4cy)]
-    mirror_angles = [m1a, m2a, m3a, m4a] #in degrees
+    mirror_angles = [m1a, m2a, m3a, m4a]  # degrees
 
     for center, length, angle in zip(mirror_centers, mirror_lengths, mirror_angles):
         mirrors.append(calculate_mirror_endpoints(center, length, angle))
@@ -242,89 +266,120 @@ def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4
     plt.figure(figsize=(12, 10))
     plt.scatter(*laser_start, color='red', label="Laser Source", linewidth=1)
 
-    #Piezo mount outline visualizer
+    # Piezo mount outline visualizer
     doubled_lines, orthogonal_lines = process_mirrors(mirrors)
 
-    # Draw the mirrors
-    for i, mirror in enumerate(mirrors):
-        plt.plot([mirror[0][0], mirror[1][0]], [mirror[0][1], mirror[1][1]], color = 'black', linewidth=3)
+    # Draw mirrors
+    for mirror in mirrors:
+        plt.plot([mirror[0][0], mirror[1][0]],
+                 [mirror[0][1], mirror[1][1]],
+                 color='black', linewidth=3)
 
-    #Draw piezo mirror mounts outline for fitting purposes
-    for i, mirror in enumerate(doubled_lines):
-        plt.plot([mirror[0][0], mirror[1][0]], [mirror[0][1], mirror[1][1]], linewidth=1, color = 'black')
+    # Draw mirror mount outlines
+    for mirror in doubled_lines:
+        plt.plot([mirror[0][0], mirror[1][0]],
+                 [mirror[0][1], mirror[1][1]],
+                 linewidth=1, color='black')
 
-    for i, mirror in enumerate(orthogonal_lines):
-        plt.plot([mirror[0][0], mirror[1][0]], [mirror[0][1], mirror[1][1]], linewidth=1, color = 'black')
+    for mirror in orthogonal_lines:
+        plt.plot([mirror[0][0], mirror[1][0]],
+                 [mirror[0][1], mirror[1][1]],
+                 linewidth=1, color='black')
 
-    # Simulate laser reflections
+    # --- Laser simulation ---
     max_reflections = 36
     current_position = laser_start
     current_angle = laser_angle
-    last_mirror = None
     reflection_count = 0
+    mirror_index = 0  # start with M1
 
     for i in range(max_reflections):
-        intersection, reflected_end, hit_mirror = reflect_laser(current_position, current_angle, mirrors, last_mirror)
+
+        intersection, reflected_end, inside = reflect_laser_ordered(
+            current_position,
+            current_angle,
+            mirrors[mirror_index])
+
+        # If ray never even intersects mirror plane
         if intersection is None:
-            # No more intersections
             plt.plot(
-                [current_position[0], current_position[0] + np.cos(np.radians(current_angle)) * 1000],
-                [current_position[1], current_position[1] + np.sin(np.radians(current_angle)) * 1000],
-                'g--'
-            )
+                [current_position[0],
+                 current_position[0] + np.cos(np.radians(current_angle)) * 1000],
+                [current_position[1],
+                 current_position[1] + np.sin(np.radians(current_angle)) * 1000],
+                'g--')
             break
 
-        # Draw the laser and reflection
-        plt.plot([current_position[0], intersection[0]], [current_position[1], intersection[1]], 'r-', linewidth =1)
-        #plt.plot([intersection[0], reflected_end[0]], [intersection[1], reflected_end[1]], 'g-')
-        #plt.scatter(*intersection, color='orange', label=f"Intersection {i+1}")
-    
-        # Update for next reflection
+        # If intersection exists but outside mirror segment → beam exits system
+        if not inside:
+            plt.plot(
+                [current_position[0],
+                 current_position[0] + np.cos(np.radians(current_angle)) * 1000],
+                [current_position[1],
+                 current_position[1] + np.sin(np.radians(current_angle)) * 1000],
+                'g--')
+            break
+
+        # Valid reflection
+        plt.plot(
+            [current_position[0], intersection[0]],
+            [current_position[1], intersection[1]],
+            'r-', linewidth=1)
+
+        # Update ray state
         current_position = intersection
         current_angle = np.degrees(np.arctan2(
             reflected_end[1] - intersection[1],
-            reflected_end[0] - intersection[0],
-        ))
-        last_mirror = hit_mirror
+            reflected_end[0] - intersection[0]))
+
         reflection_count += 1
 
-    laser_path, total_length = simulate_laser_with_length(laser_start, laser_angle, mirrors)
+        # Move to next mirror (M1→M2→M3→M4→repeat)
+        mirror_index = (mirror_index + 1) % len(mirrors)
 
-    #Indicate where to cut off laser distance calculation (x=?)
-    a=laser_path[-2]
-    b=laser_path[-1]
-    x=0
+    # Compute full path + length
+    laser_path, total_length = simulate_laser_with_length(
+        laser_start, laser_angle, mirrors)
+
+    # --- Exit distance calculation ---
+    a = laser_path[-2]
+    b = laser_path[-1]
+    x = 0
+
     slope = (b[1] - a[1]) / (b[0] - a[0])
     y = a[1] + slope * (x - a[0])
     x_point = (x, y)
+
     distance = np.sqrt((x_point[0] - a[0])**2 + (x_point[1] - a[1])**2)
 
-    #Identify if the exiting beam gets clipped with M4
-    a = np.array([a[0], a[1]])
-    b = np.array([b[0], b[1]])
+    # --- Check clipping with M4 ---
+    a = np.array(a)
+    b = np.array(b)
     m = np.array([m4cx, m4cy])
+
     v = b - a
     d = np.array([np.cos(np.deg2rad(m4a)), np.sin(np.deg2rad(m4a))])
+
     A = np.column_stack((v, -d))
     t, s = np.linalg.solve(A, m - a)
+
     if 0 <= t <= 1:
         p = a + t * v
         dist = np.linalg.norm(p - m)
     else:
-        # Beam does not pass near M4 — no clipping possible
         print("Beam does not intersect M4 region")
         dist = np.inf
 
-    if dist >= 14.3: # Mirror diameter = 25.4mm. laser beam diameter = 3mm. (25.4/2) + (3/2) + 0.1(<- additional edge of mirror error)
-        print("NOT CLIPPED, room to spare: ", dist-14.3, "mm")
+    if dist >= 14.3:
+        print("NOT CLIPPED, room to spare:", dist - 14.3, "mm")
     else:
-        print("CLIPPED, ", dist-14.3, 'mm too much')
-        
-    print("Laser Path:", laser_path)
-    print("Total Laser Length:", total_length+distance, "mm")
-    print("Total Number of Reflection (N_R) = ", reflection_count)
+        print("CLIPPED,", dist - 14.3, "mm too much")
 
-    # Finalize plot
+    print("Laser Path:", laser_path)
+    print("Total Laser Length:", total_length + distance, "mm")
+    print("Total Number of Reflection (N_R) =", reflection_count)
+
+    # Plot settings
     plt.xlim(-310, 250)
     plt.ylim(-10, 210)
     plt.axhline(0, color='black', linewidth=1)
@@ -334,59 +389,61 @@ def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4
     plt.xlabel("X (mm)")
     plt.ylabel("Y (mm)")
     plt.grid(True, linewidth=0.3)
-    plt.plot([qc_1[0],qc_1[0]],[qc_1[1] - 2, qc_1[1] + 2], linewidth=4, label='QC1') # Quadcell Detector 1
-    plt.plot([qc_2[0],qc_2[0]],[qc_2[1] - 2, qc_2[1] + 2], linewidth=4, label='QC2') # Quadcell Detector 2
+    plt.plot([qc_1[0], qc_1[0]], [qc_1[1] - 2, qc_1[1] + 2], linewidth=4, label='QC1')
+    plt.plot([qc_2[0], qc_2[0]], [qc_2[1] - 2, qc_2[1] + 2], linewidth=4, label='QC2')
     plt.legend(prop={'size': 8})
     plt.show()
 
-def simulation_reflec(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
-    """
-    Simulates the laser path and returns a list of coordinates for each reflection point.
-    Output: [(x0, y0), (x1, y1), ... (xn, yn)]
-    """
-    # 1. Setup Mirror Endpoints
-    mirror_centers = [(m1cx, m1cy), (m2cx, m2cy), (m3cx, m3cy), (m4cx, m4cy)]
+def simulation_reflec(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy,
+    m1a, m2a, m3a, m4a, expected_reflections=7
+):
+    mirror_centers = [(m1cx, m1cy), (m2cx, m2cy),
+                      (m3cx, m3cy), (m4cx, m4cy)]
     mirror_angles = [m1a, m2a, m3a, m4a]
-    
+
     mirrors = []
-    for center, length, angle in zip(mirror_centers, mirror_lengths, mirror_angles):
+    for center, length, angle in zip(
+        mirror_centers, mirror_lengths, mirror_angles
+    ):
         mirrors.append(calculate_mirror_endpoints(center, length, angle))
 
-    # 2. Simulation Loop
-    max_reflections = 36
     current_position = laser_start
     current_angle = laser_angle
-    last_mirror = None
-    
-    # Initialize path with the starting point
-    path = [current_position]
 
-    for _ in range(max_reflections):
-        intersection, reflected_end, hit_mirror = reflect_laser(
-            current_position, current_angle, mirrors, last_mirror
+    path = []
+
+    for i in range(expected_reflections):
+        mirror_index = i % 4
+        mirror = mirrors[mirror_index]
+
+        intersection, reflected_end, inside = reflect_laser_ordered(
+            current_position, current_angle, mirror
         )
-        
+
         if intersection is None:
-            # Optional: Add one final point far in the distance to show the exit beam
-            exit_dist = 1000
-            final_x = current_position[0] + np.cos(np.radians(current_angle)) * exit_dist
-            final_y = current_position[1] + np.sin(np.radians(current_angle)) * exit_dist
-            path.append((final_x, final_y))
+            # rare degeneracy fallback
+            path.append({
+                "pt": None,
+                "mirror": mirror_index,
+                "inside": False
+            })
             break
 
-        # Append the reflection point
-        path.append(intersection)
-        
-        # Update for next reflection
+        path.append({
+            "pt": intersection,
+            "mirror": mirror_index,
+            "inside": inside
+        })
+
         current_position = intersection
         current_angle = np.degrees(np.arctan2(
             reflected_end[1] - intersection[1],
             reflected_end[0] - intersection[0],
         ))
-        last_mirror = hit_mirror
 
     return path
 
+# Tells us the exit angle, total laser length, and quadcell displacement
 def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
     mirrors = []
 
@@ -397,41 +454,54 @@ def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m
     for center, length, angle in zip(mirror_centers, mirror_lengths, mirror_angles):
         mirrors.append(calculate_mirror_endpoints(center, length, angle))
 
-    #Piezo mount outline visualizer
-    doubled_lines, orthogonal_lines = process_mirrors(mirrors)
-
-    # Simulate laser reflections
-    max_reflections = 36
-    current_position = laser_start
-    current_angle = laser_angle
-    last_mirror = None
-
     laser_path, total_length = simulate_laser_with_length(laser_start, laser_angle, mirrors)
 
     #Indicate where to cut off laser distance calculation (x=?)
-    a=laser_path[-2]
-    b=laser_path[-1]
-    x=0
-    slope = (b[1] - a[1]) / (b[0] - a[0])
-    y = a[1] + slope * (x - a[0])
-    x_point = (x, y)
-    distance = np.sqrt((x_point[0] - a[0])**2 + (x_point[1] - a[1])**2)
+    a = np.array(laser_path[-2])
+    b = np.array(laser_path[-1])
 
-    last_two = laser_path[-2:]
-    exit_slope = (last_two[1][1]-last_two[0][1])/(last_two[1][0]-last_two[0][0])
-    y_int=last_two[1][1]-exit_slope*last_two[1][0]
-    y191=exit_slope*-191+y_int
-    y200=exit_slope*-200+y_int
-    y300=exit_slope*-300+y_int
-    y595=exit_slope*-595+y_int
-    print(f"Exit angle: {exit_slope}")
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+
+    # exit slope
+    if abs(dx) < 1e-9:
+        exit_slope = np.inf
+    else:
+        exit_slope = dy / dx
+
+    # intercept
+    y_int = a[1] - exit_slope * a[0]
+
+    # cut-off point at x=0
+    x = 0
+    y = exit_slope * x + y_int
+    x_point = np.array([x, y])
+
+    distance = np.linalg.norm(x_point - a)
+
+    # evaluate beam height at diagnostic x positions
+    def y_at(x):
+        return exit_slope * x + y_int
+
+    y191 = y_at(-191)
+    y200 = y_at(-200)
+    y300 = y_at(-300)
+    y595 = y_at(-595)
+
+    print(f"Exit slope: {exit_slope}")
     print(f"Total length: {total_length + distance}")
-    print(f"y191: {y191-160}")
-    print(f"y200: {y200-163.5}")
-    print(f"y300: {y300-190}")
-    print(f"y595: {y595-268.3}")
+    print(f"y191 error: {y191 - 160}")
+    print(f"y200 error: {y200 - 163.5}")
+    print(f"y300 error: {y300 - 190}")
+    print(f"y595 error: {y595 - 268.3}")
 
-    return exit_slope, total_length + distance, y191-160, y300-190, y595-268.3
+    return (
+        exit_slope,
+        total_length + distance,
+        y191 - 160,
+        y300 - 190,
+        y595 - 268.3
+    )
 
 # TRANSITION FUNCTIONS
 
@@ -955,87 +1025,92 @@ def aruco_pixel_residuals(theta, img_path):
     residuals = (M_all_px - camera_aruco_coords).reshape(-1)
     return residuals
 
-def refl_residuals_fixedK(meas_pts, sim_pts, K, sigma=SIGMA_REFL, big_pen=BIG_PEN):
-
-    meas = np.asarray(meas_pts, float).reshape(-1, 2)
-    sim  = np.asarray(sim_pts,  float).reshape(-1, 2)
-
-    if K == 0:
-        r_match = np.array([], dtype=float)
-
-    elif sim.size == 0:
-        r_match = np.full((K,), big_pen / sigma, dtype=float)
-
-    else:
-        dists = np.linalg.norm(meas[:, None, :] - sim[None, :, :], axis=2)
-
-        row_ind, col_ind = linear_sum_assignment(dists)
-
-        r_match = dists[row_ind, col_ind] / sigma
-
-    # Count penalty (still discontinuous — you said you'll fix later)
-    n_sim = sim.shape[0] if sim.size else 0
-    missing = max(0, K - n_sim)
-    extra   = max(0, n_sim - K)
-
-    r_count = np.array([missing * (big_pen / sigma),
-                        extra   * (big_pen / sigma)], dtype=float)
-
-    return np.concatenate([r_match, r_count])
-
 # The residuals (differences) between the measured and simulated components (ArUcos, Reflection points, ...)
-def residuals(theta, img_path_light, K_by_mirror, reflec_cam):
-    
-    M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a = theta
-    # ---- ArUco pixel residuals ----
-    # big_equation should return a 1D array of pixel residuals: [du1, dv1, du2, dv2, ...]
-    r_aruco_px = aruco_pixel_residuals(theta, img_path_light)
+def residuals(theta, img_path_light, reflec_cam):
 
-    # Normalize by expected pixel noise
+    M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a = theta
+
+    # ---- ArUco residuals ----
+    r_aruco_px = aruco_pixel_residuals(theta, img_path_light)
     r_aruco = r_aruco_px / SIGMA_PX
 
-    # ---- Exit alignment residual ----
-    g = simulation_identifier(M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y, M1a, M2a, M3a, M4a)
+    # ---- Exit residual ----
+    g = simulation_identifier(M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y,
+        M1a, M2a, M3a, M4a)
 
-    # Reflec points from sim
-    refl_sim = simulation_reflec(M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y, M1a, M2a, M3a, M4a)
-    reflec_sim_world = refl_sim[1:-1]
-    # ---- Convert sim reflection points to pixels ----
-    refl_sim_px = []
-    for (xw, yw) in reflec_sim_world:
-        u, v = sim_to_px_reflec(xw, yw)    # returns pixel coords
-        refl_sim_px.append([float(u), float(v)])
-
-    refl_sim_px_grouped = {k: [] for k in rois.keys()}
-
-    for u, v in refl_sim_px:
-        for name, (x0, y0, x1, y1) in rois.items():
-            if x0 <= u <= x1 and y0 <= v <= y1:
-                refl_sim_px_grouped[name].append([u, v])
-                break
-
-    # ---- SAFETY CHECK (debug only) ----
-    for name in rois.keys():
-        if len(refl_sim_px_grouped[name]) == 0:
-            print(f"[WARN] No SIM reflections in {name}")
-
-    r_refl = []
-    for name in rois.keys():
-        r_refl.append(
-            refl_residuals_fixedK(
-                reflec_cam[name],              # measured points (len == K_by_mirror[name])
-                refl_sim_px_grouped[name],      # simulated points (variable)
-                K_by_mirror[name]
-            )
-        )
-
-    r_refl_pts = np.concatenate(r_refl)
-    
-    r_exit_angle = np.array([(g[0] - EXIT_TARGET) / SIGMA_EXIT], dtype=float)
-
+    r_exit_angle  = np.array([(g[0] - EXIT_TARGET) / SIGMA_EXIT], dtype=float)
     r_exit_height = np.array([(g[2]) / SIGMA_EXIT], dtype=float)
 
-    # Stack everything
+    # ---- Reflection simulation (structured) ----
+    refl_sim = simulation_reflec(M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y,
+        M1a, M2a, M3a, M4a)
+
+    mirror_centers_world = [(M1x, M1y), (M2x, M2y), (M3x, M3y), (M4x, M4y),]
+
+    r_refl = []
+
+    for mirror_index, name in enumerate(["M1", "M2", "M3", "M4"]):
+
+        meas_pts = reflec_cam[name]
+
+        sim_for_mirror = [
+            rec for rec in refl_sim
+            if rec["mirror"] == mirror_index]
+
+        half_length = mirror_lengths[mirror_index] / 2
+        cx, cy = mirror_centers_world[mirror_index]
+
+        residuals_mirror = []
+
+        if len(meas_pts) > 0:
+
+            # Convert sim points to pixel for matching
+            sim_pts_px = []
+            inside_flags = []
+
+            for rec in sim_for_mirror:
+                if rec["pt"] is None:
+                    sim_pts_px.append([np.nan, np.nan])
+                    inside_flags.append(False)
+                else:
+                    u, v = sim_to_px_reflec(*rec["pt"])
+                    sim_pts_px.append([u, v])
+                    inside_flags.append(rec["inside"])
+
+            sim_pts_px = np.asarray(sim_pts_px, float)
+            meas_pts   = np.asarray(meas_pts, float)
+
+            # Hungarian matching
+            if len(meas_pts) > 1:
+                dists = np.linalg.norm(
+                    meas_pts[:, None, :] - sim_pts_px[None, :, :],
+                    axis=2
+                )
+                row_ind, col_ind = linear_sum_assignment(dists)
+            else:
+                row_ind = np.array([0])
+                col_ind = np.array([0])
+
+            for r_idx, s_idx in zip(row_ind, col_ind):
+
+                if inside_flags[s_idx]:
+                    du = meas_pts[r_idx, 0] - sim_pts_px[s_idx, 0]
+                    dv = meas_pts[r_idx, 1] - sim_pts_px[s_idx, 1]
+                    residuals_mirror.extend([du / SIGMA_REFL,
+                                             dv / SIGMA_REFL])
+                else:
+                    # Smooth world-space miss penalty
+                    xw, yw = sim_for_mirror[s_idx]["pt"]
+                    dx = xw - cx
+                    dy = yw - cy
+                    r = np.sqrt(dx*dx + dy*dy)
+                    overshoot = max(0.0, r - half_length)
+                    residuals_mirror.append(overshoot / SIGMA_REFL)
+
+        r_refl.append(np.asarray(residuals_mirror, float))
+
+    r_refl_pts = np.concatenate(r_refl) if r_refl else np.array([])
+
     return np.concatenate([r_aruco, r_exit_angle, r_exit_height, r_refl_pts])
 
 # OVERLAYING SIMULATED MEASUREMENTS OVER THE ACTUAL MEASUREMENTS
@@ -1071,29 +1146,30 @@ def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3
         "M4": list(sim_to_px(M4x, M4y, M4a, mirror_id=4)),
     }
 
-def sim_reflection_pts_by_mirror(M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a):
-    """
-    Mimics residuals(): simulation_reflec -> take [1:-1] -> world->pixel -> group into ROI dict.
-    """
-    path = simulation_reflec(
-        M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y,
-        M1a, M2a, M3a, M4a
-    )
+def sim_reflection_pts_by_mirror(
+    M1x, M2x, M3x, M4x,
+    M1y, M2y, M3y, M4y,
+    M1a, M2a, M3a, M4a
+):
+    path = simulation_reflec(M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y,
+        M1a, M2a, M3a, M4a)
 
-    world_pts = path[1:-1]  # drop start + final "exit" point (same as residuals)
-    px_pts = []
-    for (xw, yw) in world_pts:
+    grouped = {"M1": [], "M2": [], "M3": [], "M4": []}
+
+    mirror_names = ["M1", "M2", "M3", "M4"]
+
+    for rec in path:
+
+        if rec["pt"] is None:
+            continue
+
+        xw, yw = rec["pt"]
         u, v = sim_to_px_reflec(xw, yw)
-        px_pts.append([float(u), float(v)])
 
-    grouped = {k: [] for k in rois.keys()}
-    for u, v in px_pts:
-        for name, (x0, y0, x1, y1) in rois.items():
-            if x0 <= u <= x1 and y0 <= v <= y1:
-                grouped[name].append([u, v])
-                break
+        mname = mirror_names[rec["mirror"]]
+        grouped[mname].append([float(u), float(v)])
+
     return grouped
-
 
 def overlay_reflections_and_aruco(
     img_bgr,

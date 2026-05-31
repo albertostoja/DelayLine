@@ -3,6 +3,7 @@ import matplotlib.image as mpimg
 import numpy as np
 import cv2 as cv
 import json
+import itertools
 import math
 from dataclasses import dataclass
 from sklearn.cluster import DBSCAN
@@ -467,6 +468,204 @@ def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4
     plt.legend(prop={'size': 8})
     plt.show()
 
+def simulation_fig(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
+
+    mirrors = []
+
+    # MIRROR CONFIGURATION
+    mirror_centers = [(m1cx, m1cy), (m2cx, m2cy), (m3cx, m3cy), (m4cx, m4cy)]
+    mirror_angles = [m1a, m2a, m3a, m4a]  # degrees
+
+    for center, length, angle in zip(mirror_centers, mirror_lengths, mirror_angles):
+        mirrors.append(calculate_mirror_endpoints(center, length, angle))
+
+    fig, ax = plt.subplots(figsize=(12, 5.5), frameon=False)
+
+    # Draw only the mirror faces, without the extended mount-outline helper lines.
+    for mirror in mirrors:
+        ax.plot([mirror[0][0], mirror[1][0]],
+                [mirror[0][1], mirror[1][1]],
+                color='black', linewidth=4.5, solid_capstyle='round')
+
+    # --- Laser simulation ---
+    max_reflections = 36
+    current_position = laser_start
+    current_angle = laser_angle
+    reflection_count = 0
+    mirror_index = 0  # start with M1
+
+    for i in range(max_reflections):
+
+        intersection, reflected_end, inside, _ = reflect_laser_ordered(
+            current_position,
+            current_angle,
+            mirrors[mirror_index])
+
+        if intersection is None:
+            exit_end = (
+                current_position[0] + np.cos(np.radians(current_angle)) * 1000,
+                current_position[1] + np.sin(np.radians(current_angle)) * 1000
+            )
+            ax.plot([current_position[0], exit_end[0]],
+                    [current_position[1], exit_end[1]],
+                    color='green', linestyle='--', linewidth=2)
+            break
+
+        if not inside:
+            exit_end = (
+                current_position[0] + np.cos(np.radians(current_angle)) * 1000,
+                current_position[1] + np.sin(np.radians(current_angle)) * 1000
+            )
+            ax.plot([current_position[0], exit_end[0]],
+                    [current_position[1], exit_end[1]],
+                    color='green', linestyle='--', linewidth=2)
+            break
+
+        start_for_plot = current_position
+        if i == 0:
+            start_for_plot = (
+                -65,
+                current_position[1] + np.tan(np.radians(current_angle)) * (-65 - current_position[0])
+            )
+
+        ax.plot([start_for_plot[0], intersection[0]],
+                [start_for_plot[1], intersection[1]],
+                color='red', linewidth=2)
+
+        current_position = intersection
+        current_angle = np.degrees(np.arctan2(
+            reflected_end[1] - intersection[1],
+            reflected_end[0] - intersection[0]))
+
+        reflection_count += 1
+        mirror_index = (mirror_index + 1) % len(mirrors)
+
+    # Compute full path + length using the original geometry.
+    laser_path, total_length, n_reflections = simulate_laser_with_length(
+        laser_start, laser_angle, mirrors)
+
+    # --- Exit distance calculation ---
+    a = laser_path[-2]
+    b = laser_path[-1]
+
+    # --- Check clipping with M4 ---
+    a = np.array(a)
+    b = np.array(b)
+    m = np.array([m4cx, m4cy])
+
+    v = b - a
+    d = np.array([np.cos(np.deg2rad(m4a)), np.sin(np.deg2rad(m4a))])
+
+    A = np.column_stack((v, -d))
+    t, s = np.linalg.solve(A, m - a)
+
+    if 0 <= t <= 1:
+        p = a + t * v
+        dist = np.linalg.norm(p - m)
+    else:
+        print("Beam does not intersect M4 region")
+        dist = np.inf
+
+    if dist >= 14.3:
+        print("NOT CLIPPED, room to spare:", dist - 14.3, "mm")
+    else:
+        print("CLIPPED,", dist - 14.3, "mm too much")
+
+    print("Laser Path:", laser_path)
+    print("Total Laser Length:", total_length, "mm")
+    print("Total Number of Reflection (N_R) =", reflection_count)
+
+    def y_on_exit_line(x):
+        if abs(v[0]) < 1e-9:
+            return float(a[1])
+        return float(a[1] + (v[1] / v[0]) * (x - a[0]))
+
+    def y_on_aligned_display_line(x):
+        aligned_point = np.array([167.59574381633905, 67.7389553477378])
+        aligned_slope = -0.25237623762376227
+        return float(aligned_point[1] + aligned_slope * (x - aligned_point[0]))
+
+    def draw_quadcell_snapshot(source_x, source_center_y, display_x, label, color):
+        source_hit_y = y_on_exit_line(source_x)
+        offset_y = source_hit_y - source_center_y
+        display_center_y = y_on_aligned_display_line(display_x)
+        display_hit_y = display_center_y + offset_y
+
+        # Translate a small local slice of the real exit beam into the cropped view,
+        # keeping the beam's offset from the quadcell center visible.
+        direction = v / np.linalg.norm(v)
+        half_segment = 9
+        beam_start = np.array([display_x, display_hit_y]) - direction * half_segment
+        beam_end = np.array([display_x, display_hit_y]) + direction * half_segment
+
+        frame_width = 8
+        frame_height = 18
+        x0 = display_x - frame_width / 2
+        y0 = display_center_y - frame_height / 2
+        frame = plt.Rectangle(
+            (x0, y0),
+            frame_width,
+            frame_height,
+            fill=False,
+            edgecolor=color,
+            linewidth=2.4,
+            linestyle='--'
+        )
+        ax.add_patch(frame)
+
+        ax.plot([display_x, display_x],
+                [display_center_y - 6, display_center_y + 6],
+                color=color, linewidth=2.2)
+        ax.plot([display_x - 3, display_x + 3],
+                [display_center_y, display_center_y],
+                color=color, linewidth=2.2)
+        ax.scatter([display_x], [display_center_y],
+                   s=26, facecolors='white', edgecolors=color, linewidths=2, zorder=4)
+        ax.plot([display_x, display_x],
+                [display_hit_y - 4, display_hit_y + 4],
+                color='red', linewidth=1.6, alpha=0.8)
+        ax.plot([beam_start[0], beam_end[0]],
+                [beam_start[1], beam_end[1]],
+                color='red', linewidth=2, zorder=3)
+        return source_hit_y
+
+    draw_quadcell_snapshot(-191, 158.24, -10, "QC1", "tab:blue")
+    draw_quadcell_snapshot(-595, 260.20, -30, "QC2", "tab:purple")
+
+    scale_x0 = -60
+    scale_y = 56
+    scale_length = 50
+    ax.plot([scale_x0, scale_x0 + scale_length],
+            [scale_y, scale_y],
+            color='black', linewidth=2.5, solid_capstyle='butt')
+    ax.plot([scale_x0, scale_x0],
+            [scale_y - 1.5, scale_y + 1.5],
+            color='black', linewidth=2)
+    ax.plot([scale_x0 + scale_length, scale_x0 + scale_length],
+            [scale_y - 1.5, scale_y + 1.5],
+            color='black', linewidth=2)
+    ax.text(scale_x0 + scale_length / 2, scale_y + 3.5, "5 cm",
+            ha='center', va='bottom', fontsize=40, color='black')
+
+    ax.set_xlim(-65, 185)
+    ax.set_ylim(50, 150)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.grid(False)
+    ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    fig.patch.set_facecolor('white')
+    fig.patch.set_alpha(1)
+    ax.patch.set_facecolor('white')
+    ax.patch.set_alpha(1)
+    plt.tight_layout(pad=0)
+    plt.show()
+    return fig, ax
+
 def simulation_reflec(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy,
     m1a, m2a, m3a, m4a, expected_reflections=7
 ):
@@ -518,9 +717,23 @@ def simulation_reflec(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy,
 
 # Tells us the exit angle, total laser length, and quadcell displacement
 def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
+    metrics = _simulation_metrics(
+        m1cx, m1cy, m2cx, m2cy,
+        m3cx, m3cy, m4cx, m4cy,
+        m1a, m2a, m3a, m4a
+    )
+
+    print(f"Exit slope: {metrics[0]}")
+    print(f"Total length: {metrics[1]}")
+    print(f"y191 error: {metrics[2]}")
+    print(f"y300 error: {metrics[3]}")
+    print(f"y595 error: {metrics[4]}")
+
+    return metrics
+
+def _simulation_metrics(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
     mirrors = []
 
-    # MIRROR CONFIGURATION
     mirror_centers = [(m1cx, m1cy), (m2cx, m2cy), (m3cx, m3cy), (m4cx, m4cy)]
     mirror_angles = [m1a, m2a, m3a, m4a] #in degrees
 
@@ -532,35 +745,25 @@ def simulation_identifier(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m
     if len(laser_path) < 2:
         return (np.nan, np.nan, np.nan, np.nan, np.nan)
 
-    #Indicate where to cut off laser distance calculation (x=?)
     a = np.array(laser_path[-2])
     b = np.array(laser_path[-1])
 
     dx = b[0] - a[0]
     dy = b[1] - a[1]
 
-    # exit slope
     if abs(dx) < 1e-9:
         exit_slope = np.inf
     else:
         exit_slope = dy / dx
 
-    # intercept
     y_int = a[1] - exit_slope * a[0]
 
-    # evaluate beam height at diagnostic x positions
     def y_at(x):
         return exit_slope * x + y_int
 
     y191 = y_at(-191)
     y300 = y_at(-300)
     y595 = y_at(-595)
-
-    print(f"Exit slope: {exit_slope}")
-    print(f"Total length: {total_length}")
-    print(f"y191 error: {y191 - 158.24}")
-    print(f"y300 error: {y300 - 185.75}")
-    print(f"y595 error: {y595 - 260.20}")
 
     return (
         exit_slope,
@@ -1068,26 +1271,16 @@ def sim_to_px_reflec(x, y): # For reflection points
     pixel_point = world_to_pixel(sim_M_IRL[0], sim_M_IRL[1], lsr_height)
     return pixel_point
 
-def sim_to_px(x, y, a, mirror_id):  # For ArUcos
+def sim_to_px(x, y, a):  # For ArUcos
     sim_M_IRL = sim_to_pt(x, y)
 
     Xw = sim_M_IRL[0]
     Yw = sim_M_IRL[1]
 
-    # -----------------------------------
-    # Mirror-specific geometry selection
-    # -----------------------------------
-    if mirror_id == 4:
-        s_half = 1.49 / 2
-        shift_dist = 0.0
-    else:
-        s_half = 1.3 / 2
-        shift_dist = 0.045
-
     sim_M_corners = get_mount_corners(
         Xw, Yw, lsr_height, a,
-        s_half=s_half,
-        shift_dist=shift_dist
+        s_half=1.3 / 2,
+        shift_dist=0.045
     )
 
     sim_M_corner_1 = world_to_pixel(*sim_M_corners[0])
@@ -1109,10 +1302,10 @@ def aruco_pixel_residuals(theta, img_path):
 
     M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3a, M4a = theta
 
-    M1_px = sim_to_px(M1x, M1y, M1a, mirror_id=1)
-    M2_px = sim_to_px(M2x, M2y, M2a, mirror_id=2)
-    M3_px = sim_to_px(M3x, M3y, M3a, mirror_id=3)
-    M4_px = sim_to_px(M4x, M4y, M4a, mirror_id=4)
+    M1_px = sim_to_px(M1x, M1y, M1a)
+    M2_px = sim_to_px(M2x, M2y, M2a)
+    M3_px = sim_to_px(M3x, M3y, M3a)
+    M4_px = sim_to_px(M4x, M4y, M4a)
 
     M_all_px = np.array([M1_px, M2_px, M3_px, M4_px]).reshape(-1, 2)
 
@@ -1286,27 +1479,905 @@ def unpack_variables(x, M1, M2, M3, M4): # Excluding y-values
     M4_new = np.array([x[6], M4[1], x[7]], dtype=float)
     return M1_new, M2_new, M3_new, M4_new
 
-def OPD_residuals(x, target_OPD, M1, M2, M3, M4):
+def metrics_from_variables(x, M1, M2, M3, M4):
     M1_new, M2_new, M3_new, M4_new = unpack_variables(x, M1, M2, M3, M4)
-
-    g = simulation_identifier(
+    return np.array(_simulation_metrics(
         M1_new[0], M1_new[1],
         M2_new[0], M2_new[1],
         M3_new[0], M3_new[1],
         M4_new[0], M4_new[1],
         M1_new[2], M2_new[2], M3_new[2], M4_new[2]
+    ), dtype=float)
+
+def quadcell_errors_from_variables(x, M1, M2, M3, M4):
+    g = metrics_from_variables(x, M1, M2, M3, M4)
+    return g[2], g[4]
+
+def reflection_data_from_variables(x, M1, M2, M3, M4):
+    mirrors = build_mirrors(*unpack_variables(x, M1, M2, M3, M4))
+    return trace_reflections(laser_start, laser_angle, mirrors)
+
+def reflection_us_from_variables(x, M1, M2, M3, M4, include_ends=False):
+    reflection_data = reflection_data_from_variables(x, M1, M2, M3, M4)
+
+    if not include_ends and len(reflection_data) >= 3:
+        reflection_data = reflection_data[1:-1]
+
+    return np.array([hit["u"] for hit in reflection_data], dtype=float)
+
+def reflection_edge_summary(x, M1, M2, M3, M4, include_ends=False):
+    us = reflection_us_from_variables(x, M1, M2, M3, M4, include_ends=include_ends)
+
+    if len(us) == 0:
+        return {
+            "min_u": np.nan,
+            "max_u": np.nan,
+            "closest_edge_margin": np.nan,
+            "u_values": us
+        }
+
+    return {
+        "min_u": float(np.min(us)),
+        "max_u": float(np.max(us)),
+        "closest_edge_margin": float(np.min(np.minimum(us, 1.0 - us))),
+        "u_values": us
+    }
+
+def reflection_edge_penalties_from_variables(x, M1, M2, M3, M4,
+                                             u_min=0.1,
+                                             u_max=0.9,
+                                             include_ends=False):
+    us = reflection_us_from_variables(x, M1, M2, M3, M4, include_ends=include_ends)
+    return np.array([edge_penalty(u, u_min=u_min, u_max=u_max) for u in us], dtype=float)
+
+def selected_OPD_variable_indices(moving_linear_stages=("M1",)):
+    if moving_linear_stages is None:
+        return np.arange(8, dtype=int)
+
+    linear_indices = {
+        "M1": 0,
+        "M2": 2,
+        "M3": 4,
+        "M4": 6
+    }
+
+    selected = []
+    for mirror_name in moving_linear_stages:
+        if mirror_name not in linear_indices:
+            raise ValueError(f"Unknown moving linear stage: {mirror_name}")
+        selected.append(linear_indices[mirror_name])
+
+    selected.extend([1, 3, 5, 7])
+    return np.array(sorted(set(selected)), dtype=int)
+
+def expand_selected_variables(x_selected, x_base, variable_indices):
+    x_full = np.array(x_base, dtype=float).copy()
+    x_full[np.array(variable_indices, dtype=int)] = np.array(x_selected, dtype=float)
+    return x_full
+
+def quadcell_constraints_ok(qc1_error, qc2_error,
+                            max_qc_error=2.0,
+                            max_qc_difference=2.0,
+                            tolerance=0.0):
+    return (
+        abs(qc1_error) <= max_qc_error + tolerance and
+        abs(qc2_error) <= max_qc_error + tolerance and
+        abs(qc1_error - qc2_error) <= max_qc_difference + tolerance
     )
-    g = np.array(g, dtype=float)
+
+def actuation_constraint_diagnostics(x, M1, M2, M3, M4,
+                                     max_qc_error=2.0,
+                                     max_qc_difference=2.0,
+                                     expected_reflections=None,
+                                     u_min=0.1,
+                                     u_max=0.9,
+                                     enforce_edge_bounds=True,
+                                     include_edge_ends=False,
+                                     constraint_tolerance=0.0):
+    qc1_error, qc2_error = quadcell_errors_from_variables(x, M1, M2, M3, M4)
+    mirrors = unpack_variables(x, M1, M2, M3, M4)
+    reflection_count = get_reflection_count(*mirrors)
+    edge_summary = reflection_edge_summary(x, M1, M2, M3, M4, include_ends=include_edge_ends)
+    edge_penalties = reflection_edge_penalties_from_variables(
+        x, M1, M2, M3, M4,
+        u_min=u_min - constraint_tolerance,
+        u_max=u_max + constraint_tolerance,
+        include_ends=include_edge_ends
+    )
+
+    failures = []
+    if not np.isfinite(qc1_error) or not np.isfinite(qc2_error):
+        failures.append("quadcell metric is not finite")
+    if abs(qc1_error) > max_qc_error + constraint_tolerance:
+        failures.append(f"QC1 offset {qc1_error:.4g} exceeds {max_qc_error}")
+    if abs(qc2_error) > max_qc_error + constraint_tolerance:
+        failures.append(f"QC2 offset {qc2_error:.4g} exceeds {max_qc_error}")
+    if abs(qc1_error - qc2_error) > max_qc_difference + constraint_tolerance:
+        failures.append(f"QC difference {qc1_error - qc2_error:.4g} exceeds {max_qc_difference}")
+    if expected_reflections is not None and reflection_count != expected_reflections:
+        failures.append(f"reflection count {reflection_count} != expected {expected_reflections}")
+    if enforce_edge_bounds and np.any(edge_penalties > 0):
+        failures.append(
+            f"reflection u range [{edge_summary['min_u']:.4g}, {edge_summary['max_u']:.4g}] "
+            f"outside [{u_min}, {u_max}]"
+        )
+
+    return {
+        "ok": len(failures) == 0,
+        "failures": failures,
+        "qc1_error": qc1_error,
+        "qc2_error": qc2_error,
+        "qc_difference": qc1_error - qc2_error,
+        "reflection_count": reflection_count,
+        "min_u": edge_summary["min_u"],
+        "max_u": edge_summary["max_u"],
+        "closest_edge_margin": edge_summary["closest_edge_margin"]
+    }
+
+ACTUATOR_AXES = [
+    ("M1", "dx", 0),
+    ("M1", "dangle", 1),
+    ("M2", "dx", 2),
+    ("M2", "dangle", 3),
+    ("M3", "dx", 4),
+    ("M3", "dangle", 5),
+    ("M4", "dx", 6),
+    ("M4", "dangle", 7)
+]
+
+def actuator_label(axis_index):
+    for mirror_name, command_name, idx in ACTUATOR_AXES:
+        if idx == axis_index:
+            return f"{mirror_name}.{command_name}"
+    return None
+
+def variables_with_axis_move(x, axis_index, amount):
+    x_next = np.array(x, dtype=float).copy()
+    x_next[axis_index] += amount
+    return x_next
+
+def state_satisfies_actuation_constraints(x, M1, M2, M3, M4,
+                                          max_qc_error=2.0,
+                                          max_qc_difference=2.0,
+                                          expected_reflections=None,
+                                          u_min=0.1,
+                                          u_max=0.9,
+                                          enforce_edge_bounds=True,
+                                          include_edge_ends=False,
+                                          constraint_tolerance=0.0):
+    diagnostics = actuation_constraint_diagnostics(
+        x, M1, M2, M3, M4,
+        max_qc_error=max_qc_error,
+        max_qc_difference=max_qc_difference,
+        expected_reflections=expected_reflections,
+        u_min=u_min,
+        u_max=u_max,
+        enforce_edge_bounds=enforce_edge_bounds,
+        include_edge_ends=include_edge_ends,
+        constraint_tolerance=constraint_tolerance
+    )
+    return diagnostics["ok"]
+
+def one_actuator_motion_is_valid(x_previous, x_current, M1, M2, M3, M4,
+                                 max_qc_error=2.0,
+                                 max_qc_difference=2.0,
+                                 expected_reflections=None,
+                                 motion_samples_per_step=25,
+                                 u_min=0.1,
+                                 u_max=0.9,
+                                 enforce_edge_bounds=True,
+                                 include_edge_ends=False,
+                                 constraint_tolerance=0.0):
+    delta = np.array(x_current, dtype=float) - np.array(x_previous, dtype=float)
+    if np.count_nonzero(np.abs(delta) > 1e-12) > 1:
+        return False
+
+    for fraction in np.linspace(0.0, 1.0, motion_samples_per_step + 1)[1:]:
+        x_sample = x_previous + fraction * delta
+        if not state_satisfies_actuation_constraints(
+            x_sample, M1, M2, M3, M4,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            expected_reflections=expected_reflections,
+            u_min=u_min,
+            u_max=u_max,
+            enforce_edge_bounds=enforce_edge_bounds,
+            include_edge_ends=include_edge_ends,
+            constraint_tolerance=constraint_tolerance
+        ):
+            return False
+
+    return True
+
+def actuation_path_residuals(x, x_nominal, M1, M2, M3, M4,
+                             variable_scale,
+                             max_qc_error=2.0,
+                             max_qc_difference=2.0,
+                             qc_slack=0.05,
+                             expected_reflections=None,
+                             u_min=0.1,
+                             u_max=0.9,
+                             sigma_edge=0.02,
+                             enforce_edge_bounds=True,
+                             include_edge_ends=False):
+    qc1_error, qc2_error = quadcell_errors_from_variables(x, M1, M2, M3, M4)
+
+    residuals = list((x - x_nominal) / variable_scale)
+
+    residuals.extend([
+        max(0.0, abs(qc1_error) - max_qc_error) / qc_slack,
+        max(0.0, abs(qc2_error) - max_qc_error) / qc_slack,
+        max(0.0, abs(qc1_error - qc2_error) - max_qc_difference) / qc_slack
+    ])
+
+    if expected_reflections is not None:
+        M1_new, M2_new, M3_new, M4_new = unpack_variables(x, M1, M2, M3, M4)
+        n_reflections = get_reflection_count(M1_new, M2_new, M3_new, M4_new)
+        if n_reflections != expected_reflections:
+            residuals.append(1e4 * (n_reflections - expected_reflections))
+
+    if enforce_edge_bounds:
+        edge_penalties = reflection_edge_penalties_from_variables(
+            x, M1, M2, M3, M4,
+            u_min=u_min,
+            u_max=u_max,
+            include_ends=include_edge_ends
+        )
+        residuals.extend(edge_penalties / sigma_edge)
+
+    return np.array(residuals, dtype=float)
+
+def make_actuation_step(step_index, fraction, x_previous, x_current, M1, M2, M3, M4,
+                        max_qc_error=2.0,
+                        max_qc_difference=2.0,
+                        motion_samples_per_step=None,
+                        u_min=0.1,
+                        u_max=0.9,
+                        include_edge_ends=False,
+                        enforce_edge_bounds=True,
+                        constraint_tolerance=0.0):
+    M1_new, M2_new, M3_new, M4_new = unpack_variables(x_current, M1, M2, M3, M4)
+    g = metrics_from_variables(x_current, M1, M2, M3, M4)
+    reflection_count = get_reflection_count(M1_new, M2_new, M3_new, M4_new)
+    delta = np.array(x_current, dtype=float) - np.array(x_previous, dtype=float)
+    active_axes = np.flatnonzero(np.abs(delta) > 1e-12)
+    active_axis = int(active_axes[0]) if len(active_axes) == 1 else None
+
+    commands = {
+        "M1": {"dx": x_current[0] - x_previous[0], "dangle": x_current[1] - x_previous[1]},
+        "M2": {"dx": x_current[2] - x_previous[2], "dangle": x_current[3] - x_previous[3]},
+        "M3": {"dx": x_current[4] - x_previous[4], "dangle": x_current[5] - x_previous[5]},
+        "M4": {"dx": x_current[6] - x_previous[6], "dangle": x_current[7] - x_previous[7]}
+    }
+
+    cumulative = {
+        "M1": {"x": x_current[0], "angle": x_current[1]},
+        "M2": {"x": x_current[2], "angle": x_current[3]},
+        "M3": {"x": x_current[4], "angle": x_current[5]},
+        "M4": {"x": x_current[6], "angle": x_current[7]}
+    }
+
+    qc1_error = g[2]
+    qc2_error = g[4]
+    edge_summary = reflection_edge_summary(
+        x_current, M1, M2, M3, M4,
+        include_ends=include_edge_ends
+    )
+    edge_penalties = reflection_edge_penalties_from_variables(
+        x_current, M1, M2, M3, M4,
+        u_min=u_min,
+        u_max=u_max,
+        include_ends=include_edge_ends
+    )
+
+    return {
+        "step": step_index,
+        "fraction": fraction,
+        "mirrors": (M1_new, M2_new, M3_new, M4_new),
+        "commands": commands,
+        "positions": cumulative,
+        "OPD": g[1],
+        "qc1_error": qc1_error,
+        "qc2_error": qc2_error,
+        "qc_difference": qc1_error - qc2_error,
+        "reflection_count": reflection_count,
+        "actuator": actuator_label(active_axis) if active_axis is not None else None,
+        "axis_index": active_axis,
+        "command_value": delta[active_axis] if active_axis is not None else None,
+        "single_actuator_step": len(active_axes) <= 1,
+        "motion_samples_checked": motion_samples_per_step,
+        "min_reflection_u": edge_summary["min_u"],
+        "max_reflection_u": edge_summary["max_u"],
+        "closest_edge_margin": edge_summary["closest_edge_margin"],
+        "reflection_u_values": edge_summary["u_values"],
+        "within_edge_bounds": (not enforce_edge_bounds) or not np.any(edge_penalties > 0),
+        "within_constraints": quadcell_constraints_ok(
+            qc1_error, qc2_error,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            tolerance=constraint_tolerance
+        ) and ((not enforce_edge_bounds) or not np.any(edge_penalties > 0))
+    }
+
+def build_actuation_plan_summary(steps, x_start, x_target, M1, M2, M3, M4,
+                                 start_reflections, target_reflections,
+                                 start_within_constraints,
+                                 expected_reflections,
+                                 max_qc_error=2.0,
+                                 max_qc_difference=2.0,
+                                 motion_samples_per_step=25,
+                                 u_min=0.1,
+                                 u_max=0.9,
+                                 include_edge_ends=False,
+                                 search_mode=None,
+                                 split_count=None,
+                                 failure_reason=None):
+    start_qc1_error, start_qc2_error = quadcell_errors_from_variables(x_start, M1, M2, M3, M4)
+
+    if len(steps) > 0:
+        max_abs_qc1_error = max(abs(step["qc1_error"]) for step in steps)
+        max_abs_qc2_error = max(abs(step["qc2_error"]) for step in steps)
+        max_abs_qc_difference = max(abs(step["qc_difference"]) for step in steps)
+        min_reflection_u = min(step["min_reflection_u"] for step in steps)
+        max_reflection_u = max(step["max_reflection_u"] for step in steps)
+        min_closest_edge_margin = min(step["closest_edge_margin"] for step in steps)
+    else:
+        max_abs_qc1_error = abs(start_qc1_error)
+        max_abs_qc2_error = abs(start_qc2_error)
+        max_abs_qc_difference = abs(start_qc1_error - start_qc2_error)
+        start_edge_summary = reflection_edge_summary(
+            x_start, M1, M2, M3, M4,
+            include_ends=include_edge_ends
+        )
+        min_reflection_u = start_edge_summary["min_u"]
+        max_reflection_u = start_edge_summary["max_u"]
+        min_closest_edge_margin = start_edge_summary["closest_edge_margin"]
+
+    final_error = np.array(x_target, dtype=float) - np.array(x_start, dtype=float)
+    if len(steps) > 0:
+        last_positions = pack_variables(*steps[-1]["mirrors"])
+        final_error = np.array(x_target, dtype=float) - last_positions
+
+    return {
+        "steps": steps,
+        "n_steps": len(steps),
+        "start_within_constraints": start_within_constraints,
+        "all_within_constraints": failure_reason is None and start_within_constraints and all(step["within_constraints"] for step in steps),
+        "waypoints_within_constraints": failure_reason is None and all(step["within_constraints"] for step in steps),
+        "single_actuator_steps": all(step["single_actuator_step"] for step in steps),
+        "start_qc1_error": start_qc1_error,
+        "start_qc2_error": start_qc2_error,
+        "start_qc_difference": start_qc1_error - start_qc2_error,
+        "max_abs_qc1_error": max_abs_qc1_error,
+        "max_abs_qc2_error": max_abs_qc2_error,
+        "max_abs_qc_difference": max_abs_qc_difference,
+        "start_reflections": start_reflections,
+        "target_reflections": target_reflections,
+        "preserved_reflection_count": expected_reflections is not None,
+        "max_qc_error": max_qc_error,
+        "max_qc_difference": max_qc_difference,
+        "u_min": u_min,
+        "u_max": u_max,
+        "include_edge_ends": include_edge_ends,
+        "min_reflection_u": min_reflection_u,
+        "max_reflection_u": max_reflection_u,
+        "min_closest_edge_margin": min_closest_edge_margin,
+        "motion_samples_per_step": motion_samples_per_step,
+        "search_mode": search_mode,
+        "split_count": split_count,
+        "final_variable_error": final_error,
+        "failure_reason": failure_reason
+    }
+
+def plot_actuation_quadcell_offsets(actuation_plan, show_difference=True):
+    steps = actuation_plan.get("steps", [])
+    step_numbers = [0] + [step["step"] for step in steps]
+    qc1_errors = [actuation_plan["start_qc1_error"]] + [step["qc1_error"] for step in steps]
+    qc2_errors = [actuation_plan["start_qc2_error"]] + [step["qc2_error"] for step in steps]
+    qc_differences = [actuation_plan["start_qc_difference"]] + [step["qc_difference"] for step in steps]
+
+    max_qc_error = actuation_plan.get("max_qc_error", 2.0)
+    max_qc_difference = actuation_plan.get("max_qc_difference", 2.0)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(step_numbers, qc1_errors, marker="o", linewidth=1.5, label="QC1 offset")
+    ax.plot(step_numbers, qc2_errors, marker="o", linewidth=1.5, label="QC2 offset")
+
+    if show_difference:
+        ax.plot(
+            step_numbers,
+            qc_differences,
+            marker=".",
+            linewidth=1.0,
+            linestyle="--",
+            label="QC1 - QC2"
+        )
+
+    ax.axhline(max_qc_error, color="black", linestyle=":", linewidth=1, label="+/- QC limit")
+    ax.axhline(-max_qc_error, color="black", linestyle=":", linewidth=1)
+
+    if show_difference and max_qc_difference != max_qc_error:
+        ax.axhline(max_qc_difference, color="gray", linestyle="--", linewidth=1, label="+/- difference limit")
+        ax.axhline(-max_qc_difference, color="gray", linestyle="--", linewidth=1)
+
+    ax.set_xlabel("Actuator step")
+    ax.set_ylabel("Beam offset (mm)")
+    ax.set_title("Quadcell Beam Offset During Actuation")
+    ax.grid(True, linewidth=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    return fig, ax
+
+def plot_actuation_reflection_u(actuation_plan):
+    steps = actuation_plan.get("steps", [])
+    step_numbers = [0] + [step["step"] for step in steps]
+    min_us = [np.nan] + [step["min_reflection_u"] for step in steps]
+    max_us = [np.nan] + [step["max_reflection_u"] for step in steps]
+    margins = [np.nan] + [step["closest_edge_margin"] for step in steps]
+
+    u_min = actuation_plan.get("u_min", 0.1)
+    u_max = actuation_plan.get("u_max", 0.9)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(step_numbers, min_us, marker="o", linewidth=1.5, label="minimum reflection u")
+    ax.plot(step_numbers, max_us, marker="o", linewidth=1.5, label="maximum reflection u")
+    ax.plot(step_numbers, margins, marker=".", linewidth=1.0, linestyle="--", label="closest edge margin")
+    ax.axhline(u_min, color="black", linestyle=":", linewidth=1, label="u bounds")
+    ax.axhline(u_max, color="black", linestyle=":", linewidth=1)
+    ax.set_xlabel("Actuator step")
+    ax.set_ylabel("Reflection position u")
+    ax.set_title("Reflection Positions During Actuation")
+    ax.grid(True, linewidth=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    return fig, ax
+
+def try_one_actuator_sequence(x_start, x_target, axis_sequence, M1, M2, M3, M4,
+                              max_qc_error=2.0,
+                              max_qc_difference=2.0,
+                              expected_reflections=None,
+                              motion_samples_per_step=25,
+                              u_min=0.1,
+                              u_max=0.9,
+                              enforce_edge_bounds=True,
+                              include_edge_ends=False,
+                              constraint_tolerance=0.0):
+    x_current = np.array(x_start, dtype=float).copy()
+    x_target = np.array(x_target, dtype=float)
+    steps = []
+
+    for axis_index in axis_sequence:
+        amount = x_target[axis_index] - x_current[axis_index]
+        if abs(amount) <= 1e-12:
+            continue
+
+        x_next = variables_with_axis_move(x_current, axis_index, amount)
+        if not one_actuator_motion_is_valid(
+            x_current, x_next, M1, M2, M3, M4,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            expected_reflections=expected_reflections,
+            motion_samples_per_step=motion_samples_per_step,
+            u_min=u_min,
+            u_max=u_max,
+            enforce_edge_bounds=enforce_edge_bounds,
+            include_edge_ends=include_edge_ends,
+            constraint_tolerance=constraint_tolerance
+        ):
+            return None
+
+        steps.append(make_actuation_step(
+            len(steps) + 1,
+            np.linalg.norm(x_next - x_start) / max(np.linalg.norm(x_target - x_start), 1e-12),
+            x_current, x_next, M1, M2, M3, M4,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            motion_samples_per_step=motion_samples_per_step,
+            u_min=u_min,
+            u_max=u_max,
+            include_edge_ends=include_edge_ends,
+            enforce_edge_bounds=enforce_edge_bounds,
+            constraint_tolerance=constraint_tolerance
+        ))
+        x_current = x_next
+
+    if not np.allclose(x_current, x_target, atol=1e-9, rtol=0):
+        return None
+
+    return steps
+
+def candidate_axis_orders(active_axes, delta, include_all_permutations=True):
+    active_axes = list(active_axes)
+    if len(active_axes) <= 1:
+        return [tuple(active_axes)]
+
+    ranked = tuple(sorted(active_axes, key=lambda idx: abs(delta[idx])))
+    reverse_ranked = tuple(reversed(ranked))
+
+    orders = [ranked, reverse_ranked]
+    if include_all_permutations and len(active_axes) <= 8:
+        orders.extend(itertools.permutations(active_axes))
+
+    seen = set()
+    unique_orders = []
+    for order in orders:
+        if order in seen:
+            continue
+        seen.add(order)
+        unique_orders.append(order)
+
+    return unique_orders
+
+def plan_actuation_path(x_start, x_target, M1, M2, M3, M4,
+                        max_axis_splits=64,
+                        max_qc_error=2.0,
+                        max_qc_difference=2.0,
+                        preserve_reflection_count=True,
+                        motion_samples_per_step=25,
+                        u_min=0.1,
+                        u_max=0.9,
+                        enforce_edge_bounds=True,
+                        include_edge_ends=False,
+                        constraint_tolerance=0.05,
+                        zero_tol=1e-9,
+                        verbose=False):
+    if max_axis_splits < 1:
+        raise ValueError("max_axis_splits must be at least 1.")
+
+    x_start = np.array(x_start, dtype=float)
+    x_target = np.array(x_target, dtype=float)
+
+    M_start = unpack_variables(x_start, M1, M2, M3, M4)
+    M_target = unpack_variables(x_target, M1, M2, M3, M4)
+    start_reflections = get_reflection_count(*M_start)
+    target_reflections = get_reflection_count(*M_target)
+    start_qc1_error, start_qc2_error = quadcell_errors_from_variables(x_start, M1, M2, M3, M4)
+    start_diagnostics = actuation_constraint_diagnostics(
+        x_start, M1, M2, M3, M4,
+        max_qc_error=max_qc_error,
+        max_qc_difference=max_qc_difference,
+        expected_reflections=None,
+        u_min=u_min,
+        u_max=u_max,
+        enforce_edge_bounds=enforce_edge_bounds,
+        include_edge_ends=include_edge_ends,
+        constraint_tolerance=constraint_tolerance
+    )
+    start_within_constraints = start_diagnostics["ok"]
+
+    expected_reflections = None
+    if preserve_reflection_count and start_reflections == target_reflections:
+        expected_reflections = start_reflections
+
+    delta = x_target - x_start
+    active_axes = np.flatnonzero(np.abs(delta) > zero_tol)
+
+    if not start_within_constraints:
+        return build_actuation_plan_summary(
+            [], x_start, x_target, M1, M2, M3, M4,
+            start_reflections, target_reflections, start_within_constraints,
+            expected_reflections,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            motion_samples_per_step=motion_samples_per_step,
+            u_min=u_min,
+            u_max=u_max,
+            include_edge_ends=include_edge_ends,
+            search_mode="failed",
+            split_count=0,
+            failure_reason="Starting state is outside constraints: " + "; ".join(start_diagnostics["failures"])
+        )
+
+    target_diagnostics = actuation_constraint_diagnostics(
+        x_target, M1, M2, M3, M4,
+        max_qc_error=max_qc_error,
+        max_qc_difference=max_qc_difference,
+        expected_reflections=expected_reflections,
+        u_min=u_min,
+        u_max=u_max,
+        enforce_edge_bounds=enforce_edge_bounds,
+        include_edge_ends=include_edge_ends,
+        constraint_tolerance=constraint_tolerance
+    )
+    if not target_diagnostics["ok"]:
+        return build_actuation_plan_summary(
+            [], x_start, x_target, M1, M2, M3, M4,
+            start_reflections, target_reflections, start_within_constraints,
+            expected_reflections,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            motion_samples_per_step=motion_samples_per_step,
+            u_min=u_min,
+            u_max=u_max,
+            include_edge_ends=include_edge_ends,
+            search_mode="failed",
+            split_count=0,
+            failure_reason="Target state is outside constraints: " + "; ".join(target_diagnostics["failures"])
+        )
+
+    if len(active_axes) == 0:
+        return build_actuation_plan_summary(
+            [], x_start, x_target, M1, M2, M3, M4,
+            start_reflections, target_reflections, start_within_constraints,
+            expected_reflections,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            motion_samples_per_step=motion_samples_per_step,
+            u_min=u_min,
+            u_max=u_max,
+            include_edge_ends=include_edge_ends,
+            search_mode="already_at_target",
+            split_count=0
+        )
+
+    full_axis_orders = candidate_axis_orders(active_axes, delta, include_all_permutations=True)
+    fast_axis_orders = candidate_axis_orders(active_axes, delta, include_all_permutations=False)
+
+    for axis_order in full_axis_orders:
+        steps = try_one_actuator_sequence(
+            x_start, x_target, axis_order, M1, M2, M3, M4,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            expected_reflections=expected_reflections,
+            motion_samples_per_step=motion_samples_per_step,
+            u_min=u_min,
+            u_max=u_max,
+            enforce_edge_bounds=enforce_edge_bounds,
+            include_edge_ends=include_edge_ends,
+            constraint_tolerance=constraint_tolerance
+        )
+        if steps is not None:
+            return build_actuation_plan_summary(
+                steps, x_start, x_target, M1, M2, M3, M4,
+                start_reflections, target_reflections, start_within_constraints,
+                expected_reflections,
+                max_qc_error=max_qc_error,
+                max_qc_difference=max_qc_difference,
+                motion_samples_per_step=motion_samples_per_step,
+                u_min=u_min,
+                u_max=u_max,
+                include_edge_ends=include_edge_ends,
+                search_mode="one_full_move_per_actuator",
+                split_count=1
+            )
+
+    for split_count in range(2, max_axis_splits + 1):
+        x_current = x_start.copy()
+        steps = []
+        failed = False
+
+        for split_index in range(split_count):
+            remaining_splits = split_count - split_index
+            remaining_delta = x_target - x_current
+            split_delta = remaining_delta / remaining_splits
+
+            best_order = None
+            best_steps = None
+            best_max_qc = np.inf
+
+            for axis_order in fast_axis_orders:
+                x_trial = x_current.copy()
+                trial_steps = []
+                order_failed = False
+
+                for axis_index in axis_order:
+                    amount = split_delta[axis_index]
+                    if abs(amount) <= zero_tol:
+                        continue
+
+                    x_next = variables_with_axis_move(x_trial, axis_index, amount)
+                    if not one_actuator_motion_is_valid(
+                        x_trial, x_next, M1, M2, M3, M4,
+                        max_qc_error=max_qc_error,
+                        max_qc_difference=max_qc_difference,
+                        expected_reflections=expected_reflections,
+                        motion_samples_per_step=motion_samples_per_step,
+                        u_min=u_min,
+                        u_max=u_max,
+                        enforce_edge_bounds=enforce_edge_bounds,
+                        include_edge_ends=include_edge_ends,
+                        constraint_tolerance=constraint_tolerance
+                    ):
+                        order_failed = True
+                        break
+
+                    trial_steps.append((x_trial, x_next))
+                    x_trial = x_next
+
+                if order_failed:
+                    continue
+
+                qc1_error, qc2_error = quadcell_errors_from_variables(x_trial, M1, M2, M3, M4)
+                order_max_qc = max(abs(qc1_error), abs(qc2_error), abs(qc1_error - qc2_error))
+                if order_max_qc < best_max_qc:
+                    best_order = axis_order
+                    best_steps = trial_steps
+                    best_max_qc = order_max_qc
+
+            if best_order is None:
+                failed = True
+                break
+
+            for x_previous, x_next in best_steps:
+                steps.append(make_actuation_step(
+                    len(steps) + 1,
+                    np.linalg.norm(x_next - x_start) / max(np.linalg.norm(x_target - x_start), 1e-12),
+                    x_previous, x_next, M1, M2, M3, M4,
+                    max_qc_error=max_qc_error,
+                    max_qc_difference=max_qc_difference,
+                    motion_samples_per_step=motion_samples_per_step,
+                    u_min=u_min,
+                    u_max=u_max,
+                    include_edge_ends=include_edge_ends,
+                    enforce_edge_bounds=enforce_edge_bounds,
+                    constraint_tolerance=constraint_tolerance
+                ))
+                x_current = x_next.copy()
+
+        if not failed and np.allclose(x_current, x_target, atol=1e-8, rtol=0):
+            return build_actuation_plan_summary(
+                steps, x_start, x_target, M1, M2, M3, M4,
+                start_reflections, target_reflections, start_within_constraints,
+                expected_reflections,
+                max_qc_error=max_qc_error,
+                max_qc_difference=max_qc_difference,
+                motion_samples_per_step=motion_samples_per_step,
+                u_min=u_min,
+                u_max=u_max,
+                include_edge_ends=include_edge_ends,
+                search_mode="split_single_actuator_moves",
+                split_count=split_count
+            )
+
+        if verbose:
+            print(f"No valid single-actuator path found with split_count={split_count}.")
+
+    return build_actuation_plan_summary(
+        [], x_start, x_target, M1, M2, M3, M4,
+        start_reflections, target_reflections, start_within_constraints,
+        expected_reflections,
+        max_qc_error=max_qc_error,
+        max_qc_difference=max_qc_difference,
+        motion_samples_per_step=motion_samples_per_step,
+        u_min=u_min,
+        u_max=u_max,
+        include_edge_ends=include_edge_ends,
+        search_mode="failed",
+        split_count=max_axis_splits,
+        failure_reason="No valid single-actuator path found up to max_axis_splits."
+    )
+
+def combine_actuation_plans(segment_plans):
+    if len(segment_plans) == 0:
+        return None
+
+    combined_steps = []
+    for segment_index, plan in enumerate(segment_plans, start=1):
+        for step in plan["steps"]:
+            step_new = dict(step)
+            step_new["segment"] = segment_index
+            step_new["segment_step"] = step["step"]
+            step_new["step"] = len(combined_steps) + 1
+            combined_steps.append(step_new)
+
+    first = segment_plans[0]
+
+    return {
+        "steps": combined_steps,
+        "segments": segment_plans,
+        "n_segments": len(segment_plans),
+        "n_steps": len(combined_steps),
+        "start_within_constraints": first["start_within_constraints"],
+        "all_within_constraints": all(plan["all_within_constraints"] for plan in segment_plans),
+        "waypoints_within_constraints": all(plan["waypoints_within_constraints"] for plan in segment_plans),
+        "single_actuator_steps": all(plan["single_actuator_steps"] for plan in segment_plans),
+        "start_qc1_error": first["start_qc1_error"],
+        "start_qc2_error": first["start_qc2_error"],
+        "start_qc_difference": first["start_qc_difference"],
+        "max_abs_qc1_error": max(plan["max_abs_qc1_error"] for plan in segment_plans),
+        "max_abs_qc2_error": max(plan["max_abs_qc2_error"] for plan in segment_plans),
+        "max_abs_qc_difference": max(plan["max_abs_qc_difference"] for plan in segment_plans),
+        "start_reflections": first["start_reflections"],
+        "target_reflections": segment_plans[-1]["target_reflections"],
+        "preserved_reflection_count": all(plan["preserved_reflection_count"] for plan in segment_plans),
+        "max_qc_error": first["max_qc_error"],
+        "max_qc_difference": first["max_qc_difference"],
+        "u_min": first["u_min"],
+        "u_max": first["u_max"],
+        "include_edge_ends": first["include_edge_ends"],
+        "min_reflection_u": min(plan["min_reflection_u"] for plan in segment_plans),
+        "max_reflection_u": max(plan["max_reflection_u"] for plan in segment_plans),
+        "min_closest_edge_margin": min(plan["min_closest_edge_margin"] for plan in segment_plans),
+        "motion_samples_per_step": first["motion_samples_per_step"],
+        "search_mode": "staged_OPD",
+        "split_count": max(plan["split_count"] for plan in segment_plans),
+        "final_variable_error": segment_plans[-1]["final_variable_error"],
+        "failure_reason": next((plan["failure_reason"] for plan in segment_plans if plan["failure_reason"] is not None), None)
+    }
+
+def OPD_residuals(x, target_OPD, M1, M2, M3, M4,
+                  u_min=0.1,
+                  u_max=0.9,
+                  sigma_edge=0.02,
+                  enforce_edge_bounds=True,
+                  include_edge_ends=False):
+    g = metrics_from_variables(x, M1, M2, M3, M4)
 
     r_OPD = (g[1] - target_OPD) / SIGMA_OPD
     r_qc1 = g[2] / SIGMA_QC
     r_qc2 = g[4] / SIGMA_QC
 
-    return np.array([r_OPD, r_qc1, r_qc2], dtype=float)
+    residuals = [r_OPD, r_qc1, r_qc2]
+
+    if enforce_edge_bounds:
+        edge_penalties = reflection_edge_penalties_from_variables(
+            x, M1, M2, M3, M4,
+            u_min=u_min,
+            u_max=u_max,
+            include_ends=include_edge_ends
+        )
+        residuals.extend(edge_penalties / sigma_edge)
+
+    return np.array(residuals, dtype=float)
+
+def OPD_residuals_selected(x_selected, x_base, variable_indices, target_OPD, M1, M2, M3, M4,
+                           u_min=0.1,
+                           u_max=0.9,
+                           sigma_edge=0.02,
+                           enforce_edge_bounds=True,
+                           include_edge_ends=False):
+    x_full = expand_selected_variables(x_selected, x_base, variable_indices)
+    return OPD_residuals(
+        x_full, target_OPD, M1, M2, M3, M4,
+        u_min=u_min,
+        u_max=u_max,
+        sigma_edge=sigma_edge,
+        enforce_edge_bounds=enforce_edge_bounds,
+        include_edge_ends=include_edge_ends
+    )
+
+def solve_OPD_configuration(target_OPD, M1, M2, M3, M4,
+                            moving_linear_stages=("M1",),
+                            u_min=0.1,
+                            u_max=0.9,
+                            sigma_edge=0.02,
+                            enforce_edge_bounds=True,
+                            include_edge_ends=False,
+                            verbose=0):
+    x0 = pack_variables(M1, M2, M3, M4)
+    variable_indices = selected_OPD_variable_indices(moving_linear_stages)
+    x0_selected = x0[variable_indices]
+
+    res = least_squares(
+        fun=lambda x: OPD_residuals_selected(
+            x, x0, variable_indices,
+            target_OPD, M1, M2, M3, M4,
+            u_min=u_min,
+            u_max=u_max,
+            sigma_edge=sigma_edge,
+            enforce_edge_bounds=enforce_edge_bounds,
+            include_edge_ends=include_edge_ends
+        ),
+        x0=x0_selected,
+        loss="linear",
+        f_scale=1.0,
+        verbose=verbose,
+        x_scale='jac',
+        max_nfev=4000,
+        ftol=1e-10,
+        xtol=1e-10,
+        gtol=1e-10
+    )
+
+    x_opt = expand_selected_variables(res.x, x0, variable_indices)
+    return x_opt, res
 
 # OPTIMIZING
 
-def optimize_inverse(M1, M2, M3, M4, img_path_light, img_path_dark):
+def optimize_inverse(M1, M2, M3, M4, img_path_light, img_path_dark=None):
 
     theta0 = np.array(
         [M1[0], M2[0], M3[0], M4[0],
@@ -1315,19 +2386,27 @@ def optimize_inverse(M1, M2, M3, M4, img_path_light, img_path_dark):
         dtype=float
     )
 
-    img_dark = cv.imread(img_path_dark)
-    img_gray = cv.cvtColor(img_dark, cv.COLOR_BGR2GRAY)
+    if img_path_dark is None:
+        residual_fun = lambda th: aruco_pixel_residuals(th, img_path_light) / SIGMA_PX
+    else:
+        img_dark = cv.imread(img_path_dark)
+        if img_dark is None:
+            raise ValueError(f"Could not read dark image: {img_path_dark}")
 
-    reflec_cam = reflec_pts_cam(img_gray, show=False)
-    expected_total = sum(len(v) for v in reflec_cam.values())
+        img_gray = cv.cvtColor(img_dark, cv.COLOR_BGR2GRAY)
 
-    res = least_squares(
-        fun=lambda th: residuals(
+        reflec_cam = reflec_pts_cam(img_gray, show=False)
+        expected_total = sum(len(v) for v in reflec_cam.values())
+
+        residual_fun = lambda th: residuals(
             th,
             img_path_light=img_path_light,
             reflec_cam=reflec_cam,
             expected_total=expected_total
-        ),
+        )
+
+    res = least_squares(
+        fun=residual_fun,
         x0=theta0,
         loss="linear",
         f_scale=1.0,
@@ -1437,25 +2516,154 @@ def center_quadcells(M1, M2, M3, M4,
 #                      M4_opt[0], M4_opt[1],
 #                      M1_opt[2], M2_opt[2], M3_opt[2], M4_opt[2]), best_res
 
-def choose_OPD(target_OPD, M1, M2, M3, M4):
-    x0 = pack_variables(M1, M2, M3, M4)
+def choose_OPD(target_OPD, M1, M2, M3, M4,
+               return_actuation_plan=True,
+               n_actuation_steps=None,
+               max_axis_splits=20,
+               max_qc_error=2.0,
+               max_qc_difference=2.0,
+               preserve_reflection_count=True,
+               motion_samples_per_step=25,
+               moving_linear_stages=("M1",),
+               max_OPD_step=20.0,
+               u_min=0.1,
+               u_max=0.9,
+               sigma_edge=0.02,
+               enforce_edge_bounds=True,
+               include_edge_ends=False,
+               constraint_tolerance=0.05,
+               auto_recenter_start=True,
+               recenter_constraint_tolerance=0.25,
+               optimizer_verbose=0):
+    x_start = pack_variables(M1, M2, M3, M4)
+    start_OPD = metrics_from_variables(x_start, M1, M2, M3, M4)[1]
 
-    res = least_squares(
-        fun=lambda x: OPD_residuals(x, target_OPD, M1, M2, M3, M4),
-        x0=x0,
-        loss="linear",
-        f_scale=1.0,
-        verbose=2,
-        x_scale='jac',
-        max_nfev=4000,
-        ftol=1e-10,
-        xtol=1e-10,
-        gtol=1e-10
-    )
+    if max_OPD_step is None or abs(target_OPD - start_OPD) <= max_OPD_step:
+        segment_targets = [target_OPD]
+    else:
+        n_segments = int(np.ceil(abs(target_OPD - start_OPD) / max_OPD_step))
+        segment_targets = list(np.linspace(start_OPD, target_OPD, n_segments + 1)[1:])
+
+    current_M1 = np.array(M1, dtype=float)
+    current_M2 = np.array(M2, dtype=float)
+    current_M3 = np.array(M3, dtype=float)
+    current_M4 = np.array(M4, dtype=float)
+
+    segment_plans = []
+    final_res = None
+    x_opt = None
+
+    if return_actuation_plan and auto_recenter_start:
+        start_diagnostics = actuation_constraint_diagnostics(
+            x_start, current_M1, current_M2, current_M3, current_M4,
+            max_qc_error=max_qc_error,
+            max_qc_difference=max_qc_difference,
+            expected_reflections=None,
+            u_min=u_min,
+            u_max=u_max,
+            enforce_edge_bounds=enforce_edge_bounds,
+            include_edge_ends=include_edge_ends,
+            constraint_tolerance=constraint_tolerance
+        )
+
+        if not start_diagnostics["ok"]:
+            x_recentered, final_res = solve_OPD_configuration(
+                start_OPD,
+                current_M1, current_M2, current_M3, current_M4,
+                moving_linear_stages=moving_linear_stages,
+                u_min=u_min,
+                u_max=u_max,
+                sigma_edge=sigma_edge,
+                enforce_edge_bounds=enforce_edge_bounds,
+                include_edge_ends=include_edge_ends,
+                verbose=optimizer_verbose
+            )
+
+            recenter_plan = plan_actuation_path(
+                x_start, x_recentered,
+                current_M1, current_M2, current_M3, current_M4,
+                max_axis_splits=max_axis_splits,
+                max_qc_error=max_qc_error,
+                max_qc_difference=max_qc_difference,
+                preserve_reflection_count=preserve_reflection_count,
+                motion_samples_per_step=motion_samples_per_step,
+                u_min=u_min,
+                u_max=u_max,
+                enforce_edge_bounds=False,
+                include_edge_ends=include_edge_ends,
+                constraint_tolerance=recenter_constraint_tolerance
+            )
+            recenter_plan["target_OPD"] = start_OPD
+            recenter_plan["recenter_segment"] = True
+            recenter_plan["recenter_reason"] = "; ".join(start_diagnostics["failures"])
+            segment_plans.append(recenter_plan)
+
+            if recenter_plan["failure_reason"] is not None:
+                x_opt = x_recentered
+                actuation_plan = combine_actuation_plans(segment_plans)
+                M1_opt, M2_opt, M3_opt, M4_opt = unpack_variables(
+                    x_opt, current_M1, current_M2, current_M3, current_M4
+                )
+                return (M1_opt, M2_opt, M3_opt, M4_opt), final_res, actuation_plan
+
+            current_M1, current_M2, current_M3, current_M4 = unpack_variables(
+                x_recentered,
+                current_M1, current_M2, current_M3, current_M4
+            )
+
+    for segment_target in segment_targets:
+        x_segment_start = pack_variables(current_M1, current_M2, current_M3, current_M4)
+        x_segment_target, final_res = solve_OPD_configuration(
+            segment_target,
+            current_M1, current_M2, current_M3, current_M4,
+            moving_linear_stages=moving_linear_stages,
+            u_min=u_min,
+            u_max=u_max,
+            sigma_edge=sigma_edge,
+            enforce_edge_bounds=enforce_edge_bounds,
+            include_edge_ends=include_edge_ends,
+            verbose=optimizer_verbose
+        )
+
+        if return_actuation_plan:
+            if n_actuation_steps is not None:
+                max_axis_splits = n_actuation_steps
+
+            segment_plan = plan_actuation_path(
+                x_segment_start, x_segment_target,
+                current_M1, current_M2, current_M3, current_M4,
+                max_axis_splits=max_axis_splits,
+                max_qc_error=max_qc_error,
+                max_qc_difference=max_qc_difference,
+                preserve_reflection_count=preserve_reflection_count,
+                motion_samples_per_step=motion_samples_per_step,
+                u_min=u_min,
+                u_max=u_max,
+                enforce_edge_bounds=enforce_edge_bounds,
+                include_edge_ends=include_edge_ends,
+                constraint_tolerance=constraint_tolerance
+            )
+            segment_plan["target_OPD"] = segment_target
+            segment_plans.append(segment_plan)
+
+            if segment_plan["failure_reason"] is not None:
+                x_opt = x_segment_target
+                break
+
+        current_M1, current_M2, current_M3, current_M4 = unpack_variables(
+            x_segment_target,
+            current_M1, current_M2, current_M3, current_M4
+        )
+        x_opt = x_segment_target
     
-    M1_opt, M2_opt, M3_opt, M4_opt = unpack_variables(res.x, M1, M2, M3, M4)
+    M1_opt, M2_opt, M3_opt, M4_opt = unpack_variables(x_opt, current_M1, current_M2, current_M3, current_M4)
 
-    return (M1_opt, M2_opt, M3_opt, M4_opt), res
+    if not return_actuation_plan:
+        return (M1_opt, M2_opt, M3_opt, M4_opt), final_res
+
+    actuation_plan = combine_actuation_plans(segment_plans)
+
+    return (M1_opt, M2_opt, M3_opt, M4_opt), final_res, actuation_plan
 
 # OVERLAYING SIMULATED MEASUREMENTS OVER THE ACTUAL MEASUREMENTS
 
@@ -1484,10 +2692,10 @@ def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3
     NOTE: uses fixed y values from Simulation.py (sim.M1y, sim.M2y, ...)
     """
     return {
-        "M1": list(sim_to_px(M1x, M1y, M1a, mirror_id=1)),
-        "M2": list(sim_to_px(M2x, M2y, M2a, mirror_id=2)),
-        "M3": list(sim_to_px(M3x, M3y, M3a, mirror_id=3)),
-        "M4": list(sim_to_px(M4x, M4y, M4a, mirror_id=4)),
+        "M1": list(sim_to_px(M1x, M1y, M1a)),
+        "M2": list(sim_to_px(M2x, M2y, M2a)),
+        "M3": list(sim_to_px(M3x, M3y, M3a)),
+        "M4": list(sim_to_px(M4x, M4y, M4a)),
     }
 
 def sim_reflection_pts_by_mirror(

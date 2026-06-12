@@ -933,9 +933,8 @@ def execute_OPD_closed_loop(
         final_qc_tolerance=0.5,
         final_OPD_relaxed_tolerance=0.5,
         qc_detector_limit=3.9,
-        qc_plan_limit=2.5,
-        qc_hard_limit=None,
-        max_qc_error=3.0,
+        qc_plan_limit=1.5,
+        qc_hardware_stop=3.5,
         fast_qc_avg=3,
         fast_qc_delay=0.3,
         final_qc_avg=5,
@@ -977,9 +976,7 @@ def execute_OPD_closed_loop(
     rotation_calibration = _normalized_rotation_calibration(rotation_calibration)
     rng = np.random.default_rng(rng_seed)
     choose_OPD_kwargs = dict(choose_OPD_kwargs or {})
-    if qc_hard_limit is None:
-        qc_hard_limit = max_qc_error
-    qc_hard_limit = float(qc_hard_limit)
+    qc_hardware_stop = float(qc_hardware_stop)
     qc_detector_limit = float(qc_detector_limit)
     qc_plan_limit = float(qc_plan_limit)
     final_OPD_acceptance_tolerance = max(float(target_OPD_tolerance), float(final_OPD_relaxed_tolerance))
@@ -1025,10 +1022,9 @@ def execute_OPD_closed_loop(
 
         planner_profile = []
         planner_kwargs = dict(choose_OPD_kwargs)
-        planner_kwargs.setdefault("max_qc_error", qc_hard_limit)
         planner_kwargs.setdefault("qc_detector_limit", qc_detector_limit)
         planner_kwargs.setdefault("qc_plan_limit", qc_plan_limit)
-        planner_kwargs.setdefault("qc_hard_limit", qc_hard_limit)
+        planner_kwargs.setdefault("qc_hardware_stop", qc_hardware_stop)
         planner_kwargs.setdefault("final_OPD_relaxed_tolerance", final_OPD_relaxed_tolerance)
         planner_kwargs.setdefault("final_center_qc_priority", True)
         mirrors_opt, final_res, latest_plan = S.choose_OPD(
@@ -1114,7 +1110,7 @@ def execute_OPD_closed_loop(
                         qc_readout_sign=qc_readout_sign,
                         qc_step_tolerance=qc_step_tolerance,
                         qc_replan_tolerance=qc_replan_tolerance,
-                        max_qc_error=qc_hard_limit,
+                        max_qc_error=qc_hardware_stop,
                         qc_plan_limit=qc_plan_limit,
                         qc_safety_margin=qc_safety_margin,
                         min_qc_step_tolerance=min_qc_step_tolerance,
@@ -1270,8 +1266,7 @@ def execute_OPD_closed_loop(
         "qc_safety_margin": float(qc_safety_margin),
         "qc_detector_limit": float(qc_detector_limit),
         "qc_plan_limit": float(qc_plan_limit),
-        "qc_hard_limit": float(qc_hard_limit),
-        "max_qc_error": float(max_qc_error),
+        "qc_hardware_stop": float(qc_hardware_stop),
         "min_qc_step_tolerance": float(min_qc_step_tolerance),
         "clip_qc_target_to_safety": bool(clip_qc_target_to_safety),
         "final_qc_tolerance": float(final_qc_tolerance),
@@ -1303,7 +1298,9 @@ def execute_OPD_fixed_plan(
         M1_linear_loc=None,
         M2_linear_loc=None,
         M3_linear_loc=None,
-        qc_safety_limit=3.9,
+        qc_plan_limit=1.5,
+        qc_detector_limit=3.9,
+        qc_hardware_stop=3.5,
         qc_step_tolerance=0.15,
         final_qc_tolerance=0.5,
         final_OPD_tolerance=0.5,
@@ -1325,7 +1322,8 @@ def execute_OPD_fixed_plan(
         rng_seed=None,
         profile=True,
         profile_sink=None,
-        choose_OPD_kwargs=None):
+        choose_OPD_kwargs=None,
+        **legacy_hardware_kwargs):
     """Execute one precomputed choose_OPD plan without intermediate replanning."""
     if profile and profile_sink is None:
         profile_sink = print
@@ -1341,6 +1339,14 @@ def execute_OPD_fixed_plan(
     rotation_calibration = _normalized_rotation_calibration(rotation_calibration)
     rng = np.random.default_rng(rng_seed)
     choose_OPD_kwargs = dict(choose_OPD_kwargs or {})
+    if "qc_safety_limit" in legacy_hardware_kwargs:
+        qc_hardware_stop = legacy_hardware_kwargs.pop("qc_safety_limit")
+    if len(legacy_hardware_kwargs) > 0:
+        unknown = ", ".join(sorted(legacy_hardware_kwargs))
+        raise TypeError(f"execute_OPD_fixed_plan() got unexpected keyword argument(s): {unknown}")
+    qc_plan_limit = float(qc_plan_limit)
+    qc_detector_limit = float(qc_detector_limit)
+    qc_hardware_stop = float(qc_hardware_stop)
 
     base_mirrors = (
         np.array(M1, dtype=float),
@@ -1361,10 +1367,10 @@ def execute_OPD_fixed_plan(
     )
 
     planner_kwargs = dict(choose_OPD_kwargs)
-    planner_kwargs.setdefault("max_qc_error", qc_safety_limit)
-    planner_kwargs.setdefault("qc_detector_limit", max(3.9, float(qc_safety_limit)))
-    planner_kwargs.setdefault("qc_plan_limit", min(3.0, float(qc_safety_limit)))
-    planner_kwargs.setdefault("qc_hard_limit", qc_safety_limit)
+    planner_qc_limit = qc_plan_limit
+    planner_kwargs.setdefault("qc_plan_limit", planner_qc_limit)
+    planner_kwargs.setdefault("qc_detector_limit", qc_detector_limit)
+    planner_kwargs.setdefault("qc_hardware_stop", qc_hardware_stop)
     planner_kwargs.setdefault("final_qc_tolerance", final_qc_tolerance)
     planner_kwargs.setdefault("final_center_qc_threshold", final_qc_tolerance)
     planner_kwargs.setdefault("final_OPD_relaxed_tolerance", final_OPD_tolerance)
@@ -1457,7 +1463,7 @@ def execute_OPD_fixed_plan(
                     dry_run_rotation_error=dry_run_rotation_error,
                     qc_readout_sign=qc_readout_sign,
                     qc_step_tolerance=qc_step_tolerance,
-                    qc_safety_limit=qc_safety_limit,
+                    qc_safety_limit=qc_hardware_stop,
                     fast_qc_avg=fast_qc_avg,
                     fast_qc_delay=fast_qc_delay,
                     max_rotation_chunks_per_step=max_rotation_chunks_per_step,
@@ -1542,9 +1548,9 @@ def execute_OPD_fixed_plan(
         if detail.get("failure_reason") is not None:
             failure_reason = detail["failure_reason"]
             break
-        if float(np.max(np.abs(after_qc["y"]))) > qc_safety_limit:
+        if float(np.max(np.abs(after_qc["y"]))) > qc_hardware_stop:
             failure_reason = (
-                f"Measured QC exceeded +/-{qc_safety_limit} mm after {actuator_label}."
+                f"Measured QC exceeded +/-{qc_hardware_stop} mm after {actuator_label}."
             )
             break
 
@@ -1653,7 +1659,9 @@ def execute_OPD_fixed_plan(
         }],
         "actuation_plan": actuation_plan,
         "dry_run": bool(dry_run),
-        "qc_safety_limit": float(qc_safety_limit),
+        "qc_plan_limit": float(qc_plan_limit),
+        "qc_detector_limit": float(qc_detector_limit),
+        "qc_hardware_stop": float(qc_hardware_stop),
         "qc_step_tolerance": float(qc_step_tolerance),
         "final_qc_tolerance": float(final_qc_tolerance),
         "final_OPD_tolerance": float(final_OPD_tolerance),
@@ -1728,7 +1736,9 @@ def run_fixed_plan_dry_run_trials(
         *,
         seeds=range(20),
         dry_run_rotation_error=0.10,
-        qc_safety_limit=3.9,
+        qc_plan_limit=1.5,
+        qc_detector_limit=3.9,
+        qc_hardware_stop=3.5,
         qc_step_tolerance=0.15,
         final_qc_tolerance=0.5,
         final_OPD_tolerance=0.5,
@@ -1746,7 +1756,9 @@ def run_fixed_plan_dry_run_trials(
             dry_run=True,
             rng_seed=int(seed),
             dry_run_rotation_error=dry_run_rotation_error,
-            qc_safety_limit=qc_safety_limit,
+            qc_plan_limit=qc_plan_limit,
+            qc_detector_limit=qc_detector_limit,
+            qc_hardware_stop=qc_hardware_stop,
             qc_step_tolerance=qc_step_tolerance,
             final_qc_tolerance=final_qc_tolerance,
             final_OPD_tolerance=final_OPD_tolerance,
@@ -1780,7 +1792,9 @@ def run_fixed_plan_dry_run_trials(
         "n_trials": len(rows),
         "n_success": sum(1 for row in rows if row["success"]),
         "all_success": all(row["success"] for row in rows) if rows else False,
-        "qc_safety_limit": float(qc_safety_limit),
+        "qc_plan_limit": float(qc_plan_limit),
+        "qc_detector_limit": float(qc_detector_limit),
+        "qc_hardware_stop": float(qc_hardware_stop),
         "qc_step_tolerance": float(qc_step_tolerance),
         "final_qc_tolerance": float(final_qc_tolerance),
         "final_OPD_tolerance": float(final_OPD_tolerance),
@@ -1945,8 +1959,8 @@ def run_closed_loop_dry_run_trials(
         final_qc_tolerance=0.5,
         final_OPD_relaxed_tolerance=0.5,
         qc_detector_limit=3.9,
-        qc_plan_limit=2.5,
-        qc_hard_limit=3.0,
+        qc_plan_limit=1.5,
+        qc_hardware_stop=3.5,
         profile=False,
         **execute_kwargs):
     """Run repeated closed-loop dry-runs with randomized rotation step error."""
@@ -1965,7 +1979,7 @@ def run_closed_loop_dry_run_trials(
             final_OPD_relaxed_tolerance=final_OPD_relaxed_tolerance,
             qc_detector_limit=qc_detector_limit,
             qc_plan_limit=qc_plan_limit,
-            qc_hard_limit=qc_hard_limit,
+            qc_hardware_stop=qc_hardware_stop,
             profile=profile,
             **execute_kwargs,
         )
@@ -1992,7 +2006,7 @@ def run_closed_loop_dry_run_trials(
         "all_success": all(row["success"] for row in rows) if rows else False,
         "qc_detector_limit": float(qc_detector_limit),
         "qc_plan_limit": float(qc_plan_limit),
-        "qc_hard_limit": float(qc_hard_limit),
+        "qc_hardware_stop": float(qc_hardware_stop),
         "final_qc_tolerance": float(final_qc_tolerance),
         "final_OPD_relaxed_tolerance": float(final_OPD_relaxed_tolerance),
         "dry_run_rotation_error": float(dry_run_rotation_error),

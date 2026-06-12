@@ -133,7 +133,7 @@ class QuadCellController:
         return status.PositionError
 
     def raw_to_mm(self, x_diff, y_diff, signal_sum):
-        k = 3.92435
+        k = 1.500
         signal_sum = np.asarray(signal_sum, dtype=float)
         signal_sum = np.where(signal_sum == 0, np.finfo(float).eps, signal_sum)
 

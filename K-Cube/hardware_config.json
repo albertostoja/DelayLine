@@ -1,15 +1,30 @@
 {
-  "piezo_serials": {
-    "29253216": "kpz",
-    "29253237": "kpz",
-    "113250437": "kpc",
-    "29253246": "kpz"
-  },
+  "piezo_serials": {},
   "quad_serials": [
     "69253622",
     "69253977"
   ],
-  "stage_serials": [
-    "97103046"
-  ]
+  "quad_labels": {
+    "QC1": "69253622",
+    "QC2": "69253977"
+  },
+  "linear_stage_serials": [
+    "27266900",
+    "27266901",
+    "27601694"
+  ],
+  "linear_stage_labels": {
+    "M1": "27266900",
+    "M2": "27266901",
+    "M3": "27601694"
+  },
+  "linear_stage_settings": {
+    "27266900": "Z825B",
+    "27266901": "Z825B",
+    "27601694": "Z825B"
+  },
+  "kim_stage_serials": [],
+  "rotation_stage_ports": {
+    "newport": "COM3"
+  }
 }

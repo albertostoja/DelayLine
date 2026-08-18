@@ -124,16 +124,30 @@ class QuadCellController:
             time.sleep(0.2)
             aligner.Connect(sn)
             aligner.WaitForSettingsInitialized(10000)
-            aligner.StartPolling(250)
+            aligner.StartPolling(1)
             aligner.EnableDevice()
+            try:
+                aligner.SetListenToStatus(True)
+            except Exception:
+                pass
             self.controllers[sn] = aligner
 
+    def get_status(self, sn, request=True, delay=0.01):
+        aligner = self.controllers[sn]
+
+        if request:
+            aligner.RequestStatus()
+            if delay and delay > 0:
+                time.sleep(delay)
+
+        return aligner.Status
+
     def get_position_error(self, sn):
-        status = self.controllers[sn].Status.PositionDifference
+        status = self.get_status(sn).PositionDifference
         return status.PositionError
 
     def raw_to_mm(self, x_diff, y_diff, signal_sum):
-        k = 1.500
+        k = 0.900
         signal_sum = np.asarray(signal_sum, dtype=float)
         signal_sum = np.where(signal_sum == 0, np.finfo(float).eps, signal_sum)
 
@@ -148,29 +162,33 @@ class QuadCellController:
         # this linear k * normalized-difference conversion.
         return k * x_norm, k * y_norm
 
-    def get_xy_position_raw(self, sig_strength=0.04):
+    def get_xy_position_raw(self, sig_strength=0.02):
         values = []
-        sums = self.get_sum()
 
-        for sn, signal_sum in zip(self.serial_numbers, sums):
+        for sn in self.serial_numbers:
+            status_full = self.get_status(sn)
+            signal_sum = float(status_full.Sum)
             if signal_sum > sig_strength:
-                status = self.controllers[sn].Status.PositionDifference
+                status = status_full.PositionDifference
                 values.extend([status.X, status.Y])
             else:
                 raise ValueError(f"Signal too low for {sn}: {signal_sum}")
         return values
 
-    def get_xy_position(self, sig_strength=0.04): #qc1x, qc1y, qc2x, qc2y
+    def get_xy_position(self, sig_strength=0.02, request=False):
         values = []
-        sums = self.get_sum()
-
-        for sn, signal_sum in zip(self.serial_numbers, sums):
+        for sn in self.serial_numbers:
+            # Request=False bypasses sending a slow USB request every frame
+            status_full = self.get_status(sn, request=request, delay=0)
+            signal_sum = float(status_full.Sum)
+        
             if signal_sum > sig_strength:
-                status = self.controllers[sn].Status.PositionDifference
+                status = status_full.PositionDifference
                 x_mm, y_mm = self.raw_to_mm(status.X, status.Y, signal_sum)
                 values.extend([float(x_mm), float(y_mm)])
             else:
                 raise ValueError(f"Signal too low for {sn}: {signal_sum}")
+            
         return values
 
     def get_xy_position_tavg(self, times=50, delay=0.04):
@@ -194,12 +212,25 @@ class QuadCellController:
     def get_sum(self):
         sums = []
         for sn in self.serial_numbers:
-            status = self.controllers[sn].Status.Sum
-            sums.append(status)
+            status = self.get_status(sn)
+            sums.append(float(status.Sum))
         return sums
 
     def get_signal_strength(self):
         return self.get_sum()
+
+    def get_signal_snapshot(self):
+        snapshots = []
+        for sn in self.serial_numbers:
+            status_full = self.get_status(sn)
+            pos = status_full.PositionDifference
+            snapshots.append({
+                "serial": sn,
+                "sum": float(status_full.Sum),
+                "x_raw": float(pos.X),
+                "y_raw": float(pos.Y),
+            })
+        return snapshots
 
     def shutdown(self):
         for sn, aligner in self.controllers.items():
@@ -340,8 +371,36 @@ class LinearStageController:
         print(f"Move complete for {sn}")
 
     def move_relative(self, sn, delta_mm, timeout_ms=60000):
-        current = self.get_position(sn)
-        self.move_absolute(sn, current + float(delta_mm), timeout_ms=timeout_ms)
+        device = self.controllers[sn]
+        delta = float(delta_mm)
+        distance = Decimal(abs(delta))
+        print(f"Moving KDC101 stage {sn} relative by {delta_mm} mm")
+
+        if delta == 0:
+            print(f"Move complete for {sn}")
+            return
+
+        direction = MotorDirection.Forward if delta > 0 else MotorDirection.Backward
+        device.MoveRelative(direction, distance, timeout_ms)
+
+        print(f"Move complete for {sn}")
+
+    def set_software_position(self, sn, position_mm=10.0):
+        """Set the Kinesis position counter for the current physical location."""
+        device = self.controllers[sn]
+        converter = device.UnitConverter
+        unit_type = DeviceUnitConverter.UnitType.Length
+        position_counts = int(converter.RealToDeviceUnit(Decimal(float(position_mm)), unit_type))
+        print(
+            f"Setting KDC101 stage {sn} current software position "
+            f"to {position_mm} mm ({position_counts} device units)"
+        )
+        device.SetPositionCounter(position_counts)
+        time.sleep(0.1)
+        print(f"New software position for {sn}: {self.get_position(sn)} mm")
+
+    def set_current_position(self, sn, position_mm=10.0):
+        return self.set_software_position(sn, position_mm=position_mm)
 
     def get_position(self, sn):
         device = self.controllers[sn]

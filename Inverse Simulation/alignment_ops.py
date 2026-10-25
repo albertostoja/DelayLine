@@ -1,4 +1,6 @@
+import pickle
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,6 +24,9 @@ DEFAULT_LINEAR_STAGE_REPLAN_TOLERANCE_MM = 1e-3
 
 DEFAULT_ROTATION_CONTROLLER = "newport"
 DEFAULT_ROTATION_DEGREES_PER_SUBSTEP = 0.0023
+# Approximate physical response for N_R dry runs; hardware command estimates
+# remain separate. Real staging takes about three times as many steps.
+DEFAULT_REFLECTION_DRY_RUN_DEGREES_PER_SUBSTEP = 0.0007
 
 DEFAULT_ACTUATOR_MAP = {
     "M1.dx": {
@@ -218,22 +223,23 @@ def _read_quadcell_x_with_signal(
             "signal_strengths": signals.tolist(),
             "signal_thresholds": thresholds.tolist(),
             "valid_mask": valid_mask.tolist(),
-            "valid": bool(np.all(valid_mask)),
+            "valid": bool(np.all(valid_mask) and np.all(np.isfinite(x))),
             "error": None,
         }
 
     if hardware is None or not hasattr(hardware, "quads"):
         raise ValueError("A HardwareOps-like object with .quads is required unless dry_run=True.")
 
-    signals = np.array(hardware.quads.get_signal_strength(), dtype=float)
-    if signals.size != 2:
-        raise ValueError(f"Expected two quadcell signal strengths, got {signals.tolist()}.")
+    serial_numbers = list(hardware.quads.serial_numbers)
+    if len(serial_numbers) != 2:
+        raise ValueError(f"Expected two quadcells, got {serial_numbers}.")
 
-    valid_mask = signals >= thresholds
+    signals = []
+    normalized_x = []
     values = []
     raw = []
     read_error = None
-    for sn, signal_sum in zip(hardware.quads.serial_numbers, signals):
+    for sn in serial_numbers:
         try:
             if hasattr(hardware.quads, "get_status"):
                 status_full = hardware.quads.get_status(sn)
@@ -242,14 +248,23 @@ def _read_quadcell_x_with_signal(
             status = status_full.PositionDifference
             signal_sum = float(status_full.Sum)
             x_mm, y_mm = hardware.quads.raw_to_mm(status.X, status.Y, signal_sum)
+            signals.append(signal_sum)
+            normalized_x.append(float(status.X) / signal_sum if signal_sum > 0 else np.nan)
             values.extend([float(x_mm), float(y_mm)])
             raw.extend([status.X, status.Y])
         except Exception as exc:
             read_error = str(exc)
+            signals.append(np.nan)
+            normalized_x.append(np.nan)
             values.extend([np.nan, np.nan])
             raw.extend([np.nan, np.nan])
 
     x = np.array([values[0], values[2]], dtype=float)
+    signals = np.array(signals, dtype=float)
+    valid_mask = np.isfinite(signals) & (signals >= thresholds)
+    # A ratio above one alone does not establish controller saturation. Keep
+    # the legacy metadata fields, but do not impose the removed software clip.
+    saturated = np.zeros(2, dtype=bool)
     return {
         "raw": raw,
         "x": x,
@@ -258,9 +273,56 @@ def _read_quadcell_x_with_signal(
         "signal_strengths": signals.tolist(),
         "signal_thresholds": thresholds.tolist(),
         "valid_mask": valid_mask.tolist(),
-        "valid": bool(np.all(valid_mask) and np.all(np.isfinite(x))),
+        "signal_valid": bool(np.all(valid_mask)),
+        "normalized_x": list(normalized_x),
+        "position_saturated_mask": saturated.tolist(),
+        "position_saturated": bool(np.any(saturated)),
+        "valid": bool(np.all(valid_mask) and np.all(np.isfinite(x)) and not np.any(saturated)),
         "error": read_error,
     }
+
+
+def _qc_model_comparison(x_estimate, base_mirrors, qc, qc_readout_sign):
+    predicted = _quadcell_readout_from_sim_qc(
+        S.quadcell_errors_from_variables(x_estimate, *base_mirrors), qc_readout_sign
+    )
+    residual = np.asarray(qc["x"], dtype=float) - predicted
+    return {
+        "measured_qc_x": np.asarray(qc["x"], dtype=float).tolist(),
+        "predicted_qc_x": predicted.tolist(),
+        "qc_residual_x": residual.tolist(),
+        "qc_residual_norm": float(np.linalg.norm(residual)),
+        "qc_position_valid": bool(qc["valid"]),
+        "qc_position_saturated": bool(qc.get("position_saturated", False)),
+    }
+
+
+def _qc_invalid_details(qc):
+    issues = []
+    signals = qc.get("signal_strengths", [])
+    thresholds = qc.get("signal_thresholds", [np.nan] * len(signals))
+    for index, (signal, threshold) in enumerate(zip(signals, thresholds), start=1):
+        if not np.isfinite(signal):
+            issues.append(f"QC{index} signal is nonfinite")
+        elif np.isfinite(threshold) and signal < threshold:
+            issues.append(f"QC{index} signal={signal:.6g} < minimum={threshold:.6g}")
+    for index, position in enumerate(qc.get("x", []), start=1):
+        if not np.isfinite(position):
+            issues.append(f"QC{index} position is nonfinite")
+    if qc.get("error"):
+        issues.append(f"read error: {qc['error']}")
+    return "; ".join(issues) or "QC signal/position is invalid"
+
+
+def _staging_qc_failure(qc, qc_limit):
+    if qc.get("position_saturated", False):
+        return "stage_qc_saturated: QC position is clipped; the spot position is unknown."
+    if not qc["valid"]:
+        return "stage_qc_invalid: " + _qc_invalid_details(qc) + " during same-N_R staging."
+    max_abs = float(np.max(np.abs(qc["x"])))
+    if max_abs > float(qc_limit):
+        return f"stage_qc_limit: QC max abs {max_abs:.6g} exceeds {qc_limit:g} during staging."
+    return None
 
 
 def _initial_linear_stage_locs(
@@ -419,6 +481,77 @@ def assimilate_rotation_angle_from_qc(
     }
 
 
+def _assimilate_staging_rotation_from_qc(
+        x_current, x_before_step, step, measured_qc, base_mirrors, *,
+        expected_reflections, qc_readout_sign, max_fit_error):
+    """Fit staging on its source branch without trusting optimizer status alone."""
+    axis = int(step["axis_index"])
+    planned_angle = float(S.pack_variables(*step["mirrors"])[axis])
+    target = _sim_qc_from_quadcell_readout(measured_qc, qc_readout_sign)
+    priors = (
+        ("pulse_prior", float(x_current[axis])),
+        ("relative_plan_prior", float(x_before_step[axis] + step["command_value"])),
+        ("planned_endpoint_prior", planned_angle),
+        ("previous_angle_prior", float(x_before_step[axis])),
+    )
+    candidates = []
+    attempts = []
+    seen = set()
+    for source, prior in priors:
+        if prior in seen or not np.isfinite(prior):
+            continue
+        seen.add(prior)
+        trial = np.array(x_current, dtype=float).copy()
+        trial[axis] = prior
+        count = int(S.get_reflection_count(*S.unpack_variables(trial, *base_mirrors)))
+        if count != expected_reflections:
+            attempts.append({
+                "prior_source": source, "angle_prior": prior, "seed_reflections": count,
+                "accepted": False, "reason": "seed is outside the expected reflection branch",
+            })
+            continue
+        predicted = np.asarray(S.quadcell_errors_from_variables(trial, *base_mirrors), dtype=float)
+        if not np.all(np.isfinite(predicted)):
+            attempts.append({
+                "prior_source": source, "angle_prior": prior, "seed_reflections": count,
+                "accepted": False, "reason": "seed is outside the expected finite-QC branch",
+            })
+            continue
+        candidates.append((float(np.linalg.norm(predicted - target)), source, prior))
+    candidates.sort(key=lambda candidate: candidate[0])
+
+    for _, source, prior in candidates:
+        try:
+            fitted, info = assimilate_rotation_angle_from_qc(
+                x_current, axis, measured_qc, *base_mirrors,
+                qc_readout_sign=qc_readout_sign, angle_prior=prior,
+                angle_window=max(0.05, abs(x_current[axis] - prior) + 0.02),
+            )
+            count = int(S.get_reflection_count(*S.unpack_variables(fitted, *base_mirrors)))
+            error = float(info["fit_error_norm"])
+            accepted = bool(
+                info["success"] and np.all(np.isfinite(fitted)) and np.isfinite(error) and
+                error <= max_fit_error and count == expected_reflections
+            )
+            attempts.append({
+                "prior_source": source, "angle_prior": prior, "angle": float(fitted[axis]),
+                "optimizer_success": bool(info["success"]), "fitted_reflections": count,
+                "fit_error_norm": error, "accepted": accepted,
+            })
+            if accepted:
+                return fitted, {
+                    **info, "accepted": True, "expected_reflections": int(expected_reflections),
+                    "fitted_reflections": count, "prior_source": source, "fit_attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({"prior_source": source, "angle_prior": prior, "accepted": False, "error": str(exc)})
+    return np.array(x_current, dtype=float).copy(), {
+        "success": False, "accepted": False, "expected_reflections": int(expected_reflections),
+        "message": f"No same-N_R={expected_reflections} angle fit matched the measured QCs within {max_fit_error:g} mm.",
+        "fit_attempts": attempts,
+    }
+
+
 def _update_rotation_calibration(
         calibration,
         actuator_label,
@@ -517,7 +650,7 @@ def calibrate_rotation_pulse_response(
         qc_min_signal=0.04,
         qc_min_signals=None,
         qc_readout_sign=-1.0,
-        rotation_settle_delay=0.5,
+        rotation_settle_delay=0.04,
         recenter_after_calibration=True,
         recenter_after_each_actuator=True,
         recenter_tolerance=0.2,
@@ -551,6 +684,7 @@ def calibrate_rotation_pulse_response(
         np.array(M4, dtype=float),
     )
     x_estimate = S.pack_variables(*base_mirrors)
+    x_initial = x_estimate.copy()
     x_physical = x_estimate.copy()
     pulse_substeps = int(abs(pulse_substeps))
     repeats = int(repeats)
@@ -1114,6 +1248,7 @@ def calibrate_rotation_pulse_response(
     )
 
     calibrated_mirrors = S.unpack_variables(x_estimate, *base_mirrors)
+    model_comparison = _qc_model_comparison(x_estimate, base_mirrors, final_qc, qc_readout_sign)
     result = {
         "success": failure_reason is None,
         "failure_reason": failure_reason,
@@ -1132,6 +1267,12 @@ def calibrate_rotation_pulse_response(
         "recenter_tolerance": float(recenter_tolerance),
         "recenter_log": recenter_log,
         "x_estimate": x_estimate.copy(),
+        "initial_x": x_initial,
+        "angle_delta_from_initial": (x_estimate - x_initial)[[1, 3, 5, 7]].tolist(),
+        "qc_shift_from_initial": (final_qc["x"] - start_qc["x"]).tolist(),
+        "initial_model_comparison": _qc_model_comparison(x_initial, base_mirrors, start_qc, qc_readout_sign),
+        "final_model_comparison": model_comparison,
+        "mirror_state_source": "qc_fitted_angle_estimate",
         "x_physical": x_physical.copy(),
         "calibrated_mirrors": calibrated_mirrors,
         "calibrated_mirrors_list": _mirrors_to_lists(calibrated_mirrors),
@@ -1141,7 +1282,12 @@ def calibrate_rotation_pulse_response(
             else np.array(qc_min_signals, dtype=float).tolist()
         ),
     }
-    log(f"done success={result['success']} failure={failure_reason}")
+    log(
+        f"done success={result['success']} failure={failure_reason} "
+        f"qc_shift={np.round(result['qc_shift_from_initial'], 4).tolist()} "
+        f"model_qc_residual={model_comparison['qc_residual_norm']:.4g} "
+        "state=qc_fitted_angle_estimate"
+    )
     return result
 
 
@@ -1574,6 +1720,43 @@ def _execute_rotation_step(
     }
 
 
+def _staging_angle_feedback_step(
+        step, x_estimate, measured_qc, base_mirrors, *, qc_readout_sign,
+        degrees_per_substep, qc_step_tolerance, qc_safety_limit, expected_reflections):
+    """Express an absolute axis-angle goal as a locally observable QC change."""
+    axis = int(step["axis_index"])
+    goal_x = np.array(x_estimate, dtype=float).copy()
+    goal_angle = float(S.pack_variables(*step["mirrors"])[axis])
+    angle_delta = goal_angle - float(goal_x[axis])
+    goal_x[axis] = goal_angle
+    if int(S.get_reflection_count(*S.unpack_variables(goal_x, *base_mirrors))) != expected_reflections:
+        raise ValueError("updated absolute-angle goal leaves the staging reflection branch")
+    start_prediction = _quadcell_readout_from_sim_qc(
+        S.quadcell_errors_from_variables(x_estimate, *base_mirrors), qc_readout_sign)
+    goal_prediction = _quadcell_readout_from_sim_qc(
+        S.quadcell_errors_from_variables(goal_x, *base_mirrors), qc_readout_sign)
+    target_qc = np.asarray(measured_qc, dtype=float) + goal_prediction - start_prediction
+    if not np.all(np.isfinite(target_qc)) or np.max(np.abs(target_qc)) > qc_safety_limit:
+        raise ValueError("updated absolute-angle QC goal is outside the staging safety window")
+
+    tolerance = float(qc_step_tolerance)
+    if abs(angle_delta) > 1e-12:
+        sensitivity = float(np.linalg.norm(goal_prediction - start_prediction) / abs(angle_delta))
+        if sensitivity > 1e-12:
+            tolerance = min(tolerance, max(1e-8, 0.5 * degrees_per_substep * sensitivity))
+    feedback_step = dict(step)
+    feedback_step["command_value"] = angle_delta
+    sim_goal = _sim_qc_from_quadcell_readout(target_qc, qc_readout_sign)
+    feedback_step.update(qc1_error=float(sim_goal[0]), qc2_error=float(sim_goal[1]))
+    return feedback_step, tolerance, {
+        "goal_mode": "absolute_angle", "target_angle_deg": goal_angle,
+        "axis_angle_error_before_deg": float(x_estimate[axis] - goal_angle),
+        "qc_step_tolerance_used": tolerance, "model_goal_x": goal_x.tolist(),
+        "original_plan_qc_x": _planned_step_qc_readout(step, qc_readout_sign).tolist(),
+        "updated_goal_qc_x": target_qc.tolist(),
+    }
+
+
 def _execute_rotation_step_fixed(
         step,
         mapping,
@@ -1594,7 +1777,11 @@ def _execute_rotation_step_fixed(
         max_rotation_chunks_per_step,
         max_rotation_chunk_substeps,
         min_rotation_chunk_substeps,
-        rotation_settle_delay):
+        rotation_settle_delay,
+        qc_reader=None,
+        dry_run_delta=None,
+        sample_callback=None,
+        stop_on_target_crossing=False):
     actuator_label = step["actuator"]
     axis_index = step["axis_index"]
     planned_angle_delta = float(step["command_value"])
@@ -1611,15 +1798,20 @@ def _execute_rotation_step_fixed(
     angle_direction = int(np.sign(planned_angle_delta) or 1)
     target_qc_y = _planned_step_qc_readout(step, qc_readout_sign)
 
-    before_qc = _read_quadcell_y(
-        hardware,
-        times=fast_qc_avg,
-        delay=fast_qc_delay,
-        dry_run=dry_run,
-        dry_run_x=x_physical,
-        base_mirrors=base_mirrors,
-        qc_readout_sign=qc_readout_sign,
-    )
+    def read_qc():
+        if qc_reader is not None:
+            return qc_reader()
+        return _read_quadcell_y(
+            hardware,
+            times=fast_qc_avg,
+            delay=fast_qc_delay,
+            dry_run=dry_run,
+            dry_run_x=x_physical,
+            base_mirrors=base_mirrors,
+            qc_readout_sign=qc_readout_sign,
+        )
+
+    before_qc = read_qc()
     current_y = before_qc["y"]
     start_y = current_y.copy()
     target_delta = target_qc_y - start_y
@@ -1645,7 +1837,10 @@ def _execute_rotation_step_fixed(
 
     stop_reason = None
     failure_reason = None
-    if best_distance <= qc_step_tolerance:
+    if not before_qc.get("valid", True):
+        stop_reason = "qc_signal_invalid"
+        failure_reason = "QC signal invalid before staging move: " + _qc_invalid_details(before_qc) + "."
+    elif best_distance <= qc_step_tolerance:
         stop_reason = "already_within_qc_step_tolerance"
 
     for chunk_index in range(1, max_rotation_chunks_per_step + 1):
@@ -1677,8 +1872,12 @@ def _execute_rotation_step_fixed(
         x_estimate_before_chunk = x_estimate.copy()
 
         if dry_run:
-            error_factor = 1.0 + rng.uniform(-dry_run_rotation_error, dry_run_rotation_error)
-            x_physical[axis_index] += sim_steps * degrees_per_substep * error_factor
+            if dry_run_delta is None:
+                error_factor = 1.0 + rng.uniform(-dry_run_rotation_error, dry_run_rotation_error)
+                actual_delta = sim_steps * degrees_per_substep * error_factor
+            else:
+                actual_delta = dry_run_delta(sim_steps)
+            x_physical[axis_index] += actual_delta
         else:
             if hardware is None or getattr(hardware, "rotation_stages", None) is None:
                 raise ValueError("hardware.rotation_stages is required to execute rotation moves.")
@@ -1690,15 +1889,7 @@ def _execute_rotation_step_fixed(
         if rotation_settle_delay and rotation_settle_delay > 0:
             time.sleep(rotation_settle_delay)
 
-        after_qc = _read_quadcell_y(
-            hardware,
-            times=fast_qc_avg,
-            delay=fast_qc_delay,
-            dry_run=dry_run,
-            dry_run_x=x_physical,
-            base_mirrors=base_mirrors,
-            qc_readout_sign=qc_readout_sign,
-        )
+        after_qc = read_qc()
         current_y = after_qc["y"]
         distance = float(np.linalg.norm(target_qc_y - current_y))
         progress = 1.0
@@ -1716,6 +1907,7 @@ def _execute_rotation_step_fixed(
         chunk_log = {
             "chunk": chunk_index,
             "hardware_steps": int(hardware_steps),
+            "sim_steps": int(sim_steps),
             "qc_x": current_y.tolist(),
             "qc_y": current_y.tolist(),
             "distance_to_target": distance,
@@ -1723,6 +1915,12 @@ def _execute_rotation_step_fixed(
             "improved": bool(improved),
         }
         chunk_logs.append(chunk_log)
+        if sample_callback is not None:
+            sample_callback(chunk_log, after_qc)
+        if not after_qc.get("valid", True):
+            stop_reason = "qc_signal_invalid"
+            failure_reason = "QC signal invalid during staging move: " + _qc_invalid_details(after_qc) + "."
+            break
 
         if float(np.max(np.abs(current_y))) > qc_safety_limit:
             if dry_run:
@@ -1733,15 +1931,9 @@ def _execute_rotation_step_fixed(
             total_commanded_substeps -= hardware_steps
             total_sim_substeps -= sim_steps
             rollback_count += 1
-            rollback_qc = _read_quadcell_y(
-                hardware,
-                times=fast_qc_avg,
-                delay=fast_qc_delay,
-                dry_run=dry_run,
-                dry_run_x=x_physical,
-                base_mirrors=base_mirrors,
-                qc_readout_sign=qc_readout_sign,
-            )
+            if rotation_settle_delay and rotation_settle_delay > 0:
+                time.sleep(rotation_settle_delay)
+            rollback_qc = read_qc()
             current_y = rollback_qc["y"]
             distance = float(np.linalg.norm(target_qc_y - current_y))
             chunk_log["rolled_back"] = True
@@ -1758,6 +1950,9 @@ def _execute_rotation_step_fixed(
 
         if distance <= qc_step_tolerance:
             stop_reason = "reached_qc_step_tolerance"
+            break
+        if stop_on_target_crossing and progress >= 1.0:
+            stop_reason = "overshot_or_past_target"
             break
         if progress >= 1.0 and not improved:
             stop_reason = "overshot_or_past_target"
@@ -2218,6 +2413,259 @@ def execute_OPD_closed_loop(
     return final_mirrors, final_res, execution
 
 
+def _coerce_profile_step_interval(profile_step_interval):
+    if profile_step_interval is None:
+        return None
+    interval = int(profile_step_interval)
+    if interval < 0:
+        raise ValueError("profile_step_interval must be non-negative or None.")
+    return interval
+
+
+def _should_log_fixed_plan_step(step_index, n_steps, actuator_label, mapping_kind, profile_step_interval, detail):
+    if profile_step_interval is None:
+        return True
+    if step_index == 1 or step_index == n_steps:
+        return True
+    if mapping_kind == "linear":
+        return True
+    if detail.get("failure_reason") is not None or detail.get("replan_recommended"):
+        return True
+    if profile_step_interval <= 0:
+        return False
+    return (step_index % profile_step_interval) == 0
+
+
+def _prepare_OPD_fixed_plan(
+        target_OPD,
+        M1,
+        M2,
+        M3,
+        M4,
+        hardware,
+        *,
+        actuator_map=None,
+        M1_linear_loc=None,
+        M2_linear_loc=None,
+        M3_linear_loc=None,
+        linear_stage_guard_mm=DEFAULT_LINEAR_STAGE_GUARD_MM,
+        qc_plan_limit=1.5,
+        qc_detector_limit=3.9,
+        qc_hardware_stop=3.5,
+        final_qc_tolerance=0.5,
+        final_OPD_tolerance=0.5,
+        dry_run=False,
+        profile=True,
+        choose_OPD_kwargs=None):
+    actuator_map = _merged_actuator_map(actuator_map)
+    active_linear_stages = _linear_stage_order_from_actuator_map(actuator_map)
+    choose_OPD_kwargs = dict(choose_OPD_kwargs or {})
+    qc_plan_limit = float(qc_plan_limit)
+    qc_detector_limit = float(qc_detector_limit)
+    qc_hardware_stop = float(qc_hardware_stop)
+    linear_stage_guard_mm = float(linear_stage_guard_mm)
+
+    base_mirrors = (
+        np.array(M1, dtype=float),
+        np.array(M2, dtype=float),
+        np.array(M3, dtype=float),
+        np.array(M4, dtype=float),
+    )
+    x_estimate = S.pack_variables(*base_mirrors)
+    x_physical = x_estimate.copy()
+
+    linear_stage_locs = _initial_linear_stage_locs(
+        hardware,
+        actuator_map,
+        M1_linear_loc=M1_linear_loc,
+        M2_linear_loc=M2_linear_loc,
+        M3_linear_loc=M3_linear_loc,
+        dry_run=dry_run,
+        prefer_hardware_positions=True,
+    )
+
+    planner_kwargs = dict(choose_OPD_kwargs)
+    planner_kwargs.setdefault("qc_plan_limit", qc_plan_limit)
+    planner_kwargs.setdefault("qc_detector_limit", qc_detector_limit)
+    planner_kwargs.setdefault("qc_hardware_stop", qc_hardware_stop)
+    planner_kwargs.setdefault("final_qc_tolerance", final_qc_tolerance)
+    planner_kwargs.setdefault("final_center_qc_threshold", final_qc_tolerance)
+    planner_kwargs.setdefault("final_OPD_relaxed_tolerance", final_OPD_tolerance)
+    planner_kwargs.setdefault("final_center_qc_priority", True)
+    planner_kwargs.setdefault("moving_linear_stages", active_linear_stages)
+    planner_kwargs.setdefault("linear_stage_guard_mm", linear_stage_guard_mm)
+
+    planner_profile = []
+    mirrors_opt, planner_res, actuation_plan = S.choose_OPD(
+        target_OPD,
+        *base_mirrors,
+        return_actuation_plan=True,
+        M1_linear_loc=linear_stage_locs["M1"],
+        M2_linear_loc=linear_stage_locs["M2"],
+        M3_linear_loc=linear_stage_locs.get("M3"),
+        profile=bool(profile),
+        profile_sink=planner_profile.append,
+        **planner_kwargs,
+    )
+
+    return {
+        "actuator_map": actuator_map,
+        "active_linear_stages": active_linear_stages,
+        "base_mirrors": base_mirrors,
+        "x_estimate": x_estimate,
+        "x_physical": x_physical,
+        "linear_stage_locs": linear_stage_locs,
+        "planner_kwargs": planner_kwargs,
+        "planner_profile": planner_profile,
+        "mirrors_opt": mirrors_opt,
+        "planner_res": planner_res,
+        "actuation_plan": actuation_plan,
+    }
+
+
+def plan_OPD_fixed_plan(
+        target_OPD,
+        M1,
+        M2,
+        M3,
+        M4,
+        hardware=None,
+        *,
+        actuator_map=None,
+        rotation_calibration=None,
+        M1_linear_loc=None,
+        M2_linear_loc=None,
+        M3_linear_loc=None,
+        linear_stage_guard_mm=DEFAULT_LINEAR_STAGE_GUARD_MM,
+        linear_stage_replan_tolerance_mm=DEFAULT_LINEAR_STAGE_REPLAN_TOLERANCE_MM,
+        qc_plan_limit=1.5,
+        qc_detector_limit=3.9,
+        qc_hardware_stop=3.5,
+        qc_step_tolerance=0.15,
+        final_qc_tolerance=0.5,
+        final_OPD_tolerance=0.5,
+        require_final_qc=False,
+        allow_final_qc_planner_failure=True,
+        fast_qc_avg=3,
+        fast_qc_delay=0.04,
+        final_qc_avg=5,
+        final_qc_delay=0.04,
+        linear_settle_delay=2.0,
+        rotation_settle_delay=0.04,
+        step_settle_delay=0.04,
+        qc_readout_sign=-1.0,
+        max_total_steps=300,
+        max_rotation_chunks_per_step=50,
+        max_rotation_chunk_substeps=50,
+        min_rotation_chunk_substeps=1,
+        dry_run=False,
+        dry_run_rotation_error=0.10,
+        rng_seed=None,
+        profile=True,
+        profile_sink=None,
+        profile_step_interval=1,
+        choose_OPD_kwargs=None,
+        **legacy_hardware_kwargs):
+    """Preview the exact plan setup used by execute_OPD_fixed_plan."""
+    del (
+        rotation_calibration,
+        linear_stage_replan_tolerance_mm,
+        qc_step_tolerance,
+        require_final_qc,
+        fast_qc_avg,
+        fast_qc_delay,
+        final_qc_avg,
+        final_qc_delay,
+        linear_settle_delay,
+        rotation_settle_delay,
+        step_settle_delay,
+        qc_readout_sign,
+        max_rotation_chunks_per_step,
+        max_rotation_chunk_substeps,
+        min_rotation_chunk_substeps,
+        dry_run_rotation_error,
+        rng_seed,
+        profile_step_interval,
+    )
+    if profile and profile_sink is None:
+        profile_sink = print
+
+    t0 = time.perf_counter()
+
+    def log(message):
+        if not profile:
+            return
+        profile_sink(f"[plan_fixed_OPD {time.perf_counter() - t0:.3f}s] {message}")
+
+    choose_OPD_kwargs = dict(choose_OPD_kwargs or {})
+    if "qc_safety_limit" in legacy_hardware_kwargs:
+        qc_hardware_stop = legacy_hardware_kwargs.pop("qc_safety_limit")
+    if len(legacy_hardware_kwargs) > 0:
+        unknown = ", ".join(sorted(legacy_hardware_kwargs))
+        raise TypeError(f"plan_OPD_fixed_plan() got unexpected keyword argument(s): {unknown}")
+
+    setup = _prepare_OPD_fixed_plan(
+        target_OPD,
+        M1,
+        M2,
+        M3,
+        M4,
+        hardware,
+        actuator_map=actuator_map,
+        M1_linear_loc=M1_linear_loc,
+        M2_linear_loc=M2_linear_loc,
+        M3_linear_loc=M3_linear_loc,
+        linear_stage_guard_mm=linear_stage_guard_mm,
+        qc_plan_limit=qc_plan_limit,
+        qc_detector_limit=qc_detector_limit,
+        qc_hardware_stop=qc_hardware_stop,
+        final_qc_tolerance=final_qc_tolerance,
+        final_OPD_tolerance=final_OPD_tolerance,
+        dry_run=dry_run,
+        profile=profile,
+        choose_OPD_kwargs=choose_OPD_kwargs,
+    )
+    actuation_plan = setup["actuation_plan"]
+    steps = actuation_plan.get("steps", [])
+    planner_failure_reason = actuation_plan.get("failure_reason")
+    planner_failure_ignored = bool(
+        planner_failure_reason is not None and
+        allow_final_qc_planner_failure and
+        _planner_failure_is_final_qc_only(planner_failure_reason) and
+        len(steps) > 0
+    )
+    failure_reason = None
+    if planner_failure_reason is not None and not planner_failure_ignored:
+        failure_reason = "Planner failed: " + planner_failure_reason
+    elif len(steps) == 0:
+        failure_reason = "Planner returned no actuation steps."
+    max_total_steps_would_stop = len(steps) > int(max_total_steps)
+
+    actuation_plan["fixed_plan_preview"] = True
+    actuation_plan["execution_preview"] = {
+        "planned_steps": int(len(steps)),
+        "max_total_steps": int(max_total_steps),
+        "max_total_steps_would_stop": bool(max_total_steps_would_stop),
+        "failure_reason": failure_reason,
+        "planner_failure_ignored": bool(planner_failure_ignored),
+        "planner_failure_reason": planner_failure_reason,
+        "linear_stage_locs": dict(setup["linear_stage_locs"]),
+        "moving_linear_stages": list(setup["active_linear_stages"]),
+        "linear_stage_guard_mm": float(linear_stage_guard_mm),
+        "planner_kwargs": dict(setup["planner_kwargs"]),
+        "planner_profile": setup["planner_profile"],
+    }
+    log(
+        f"target_OPD={target_OPD:.3f} planned_steps={len(steps)} "
+        f"max_total_steps={int(max_total_steps)} "
+        f"would_stop_at_max_total_steps={max_total_steps_would_stop} "
+        f"linear_locs={setup['linear_stage_locs']} "
+        f"linear_stage_guard={float(linear_stage_guard_mm):.3f} "
+        f"failure={failure_reason}"
+    )
+    return setup["mirrors_opt"], setup["planner_res"], actuation_plan
+
+
 def execute_OPD_fixed_plan(
         target_OPD,
         M1,
@@ -2258,9 +2706,15 @@ def execute_OPD_fixed_plan(
         rng_seed=None,
         profile=True,
         profile_sink=None,
+        profile_step_interval=1,
         choose_OPD_kwargs=None,
         **legacy_hardware_kwargs):
-    """Execute one precomputed choose_OPD plan without intermediate replanning."""
+    """Execute one precomputed choose_OPD plan without intermediate replanning.
+
+    Returned execution records, including failed runs, can be passed to
+    plot_fixed_plan_quadcell_overlay and plot_fixed_plan_reflection_u_overlay.
+    Rotation chunks retain measured QCs and estimated/dry-run angle snapshots.
+    """
     if profile and profile_sink is None:
         profile_sink = print
 
@@ -2271,8 +2725,6 @@ def execute_OPD_fixed_plan(
             return
         profile_sink(f"[execute_fixed_OPD {time.perf_counter() - t0:.3f}s] {message}")
 
-    actuator_map = _merged_actuator_map(actuator_map)
-    active_linear_stages = _linear_stage_order_from_actuator_map(actuator_map)
     rotation_calibration = _normalized_rotation_calibration(rotation_calibration)
     rng = np.random.default_rng(rng_seed)
     choose_OPD_kwargs = dict(choose_OPD_kwargs or {})
@@ -2286,50 +2738,39 @@ def execute_OPD_fixed_plan(
     qc_hardware_stop = float(qc_hardware_stop)
     linear_stage_guard_mm = float(linear_stage_guard_mm)
     linear_stage_replan_tolerance_mm = float(linear_stage_replan_tolerance_mm)
+    profile_step_interval = _coerce_profile_step_interval(profile_step_interval)
 
-    base_mirrors = (
-        np.array(M1, dtype=float),
-        np.array(M2, dtype=float),
-        np.array(M3, dtype=float),
-        np.array(M4, dtype=float),
-    )
-    x_estimate = S.pack_variables(*base_mirrors)
-    x_physical = x_estimate.copy()
-
-    linear_stage_locs = _initial_linear_stage_locs(
+    setup = _prepare_OPD_fixed_plan(
+        target_OPD,
+        M1,
+        M2,
+        M3,
+        M4,
         hardware,
-        actuator_map,
+        actuator_map=actuator_map,
         M1_linear_loc=M1_linear_loc,
         M2_linear_loc=M2_linear_loc,
         M3_linear_loc=M3_linear_loc,
+        linear_stage_guard_mm=linear_stage_guard_mm,
+        qc_plan_limit=qc_plan_limit,
+        qc_detector_limit=qc_detector_limit,
+        qc_hardware_stop=qc_hardware_stop,
+        final_qc_tolerance=final_qc_tolerance,
+        final_OPD_tolerance=final_OPD_tolerance,
         dry_run=dry_run,
-        prefer_hardware_positions=True,
+        profile=profile,
+        choose_OPD_kwargs=choose_OPD_kwargs,
     )
-
-    planner_kwargs = dict(choose_OPD_kwargs)
-    planner_qc_limit = qc_plan_limit
-    planner_kwargs.setdefault("qc_plan_limit", planner_qc_limit)
-    planner_kwargs.setdefault("qc_detector_limit", qc_detector_limit)
-    planner_kwargs.setdefault("qc_hardware_stop", qc_hardware_stop)
-    planner_kwargs.setdefault("final_qc_tolerance", final_qc_tolerance)
-    planner_kwargs.setdefault("final_center_qc_threshold", final_qc_tolerance)
-    planner_kwargs.setdefault("final_OPD_relaxed_tolerance", final_OPD_tolerance)
-    planner_kwargs.setdefault("final_center_qc_priority", True)
-    planner_kwargs.setdefault("moving_linear_stages", active_linear_stages)
-    planner_kwargs.setdefault("linear_stage_guard_mm", linear_stage_guard_mm)
-
-    planner_profile = []
-    mirrors_opt, planner_res, actuation_plan = S.choose_OPD(
-        target_OPD,
-        *base_mirrors,
-        return_actuation_plan=True,
-        M1_linear_loc=linear_stage_locs["M1"],
-        M2_linear_loc=linear_stage_locs["M2"],
-        M3_linear_loc=linear_stage_locs.get("M3"),
-        profile=bool(profile),
-        profile_sink=planner_profile.append,
-        **planner_kwargs,
-    )
+    actuator_map = setup["actuator_map"]
+    active_linear_stages = setup["active_linear_stages"]
+    base_mirrors = setup["base_mirrors"]
+    x_estimate = setup["x_estimate"]
+    x_physical = setup["x_physical"]
+    linear_stage_locs = setup["linear_stage_locs"]
+    planner_profile = setup["planner_profile"]
+    mirrors_opt = setup["mirrors_opt"]
+    planner_res = setup["planner_res"]
+    actuation_plan = setup["actuation_plan"]
 
     steps = actuation_plan.get("steps", [])
     failure_reason = None
@@ -2384,6 +2825,18 @@ def execute_OPD_fixed_plan(
             qc_readout_sign=qc_readout_sign,
         )
 
+        estimate_x_before_step = x_estimate.copy()
+        physical_x_before_step = x_physical.copy() if dry_run else None
+        rotation_samples = []
+
+        def record_rotation_sample(sample, qc):
+            sample.update(
+                estimate_x_after_pulse=x_estimate.tolist(),
+                physical_x_after_pulse=x_physical.tolist() if dry_run else None,
+                qc_signal_valid=bool(qc.get("valid", True)),
+            )
+            rotation_samples.append(sample)
+
         try:
             if mapping["kind"] == "linear":
                 detail = _execute_linear_step(
@@ -2419,12 +2872,30 @@ def execute_OPD_fixed_plan(
                     max_rotation_chunk_substeps=max_rotation_chunk_substeps,
                     min_rotation_chunk_substeps=min_rotation_chunk_substeps,
                     rotation_settle_delay=rotation_settle_delay,
+                    sample_callback=record_rotation_sample,
                 )
             else:
                 failure_reason = f"Unknown actuator kind {mapping['kind']} for {actuator_label}."
                 break
         except Exception as exc:
             failure_reason = f"Hardware execution failed for {actuator_label}: {exc}"
+            execution_log.append({
+                "execution_step": step_index,
+                "planner_step": step.get("step"),
+                "actuator": actuator_label,
+                "before_qc_raw": before_qc["raw"],
+                "before_qc_x": before_qc["x"].tolist(),
+                "before_qc_y": before_qc["y"].tolist(),
+                "estimate_x_before_step": estimate_x_before_step.tolist(),
+                "physical_x_before_step": (
+                    None if physical_x_before_step is None else physical_x_before_step.tolist()
+                ),
+                "estimate_x_after_step": x_estimate.tolist(),
+                "physical_x_after_step": x_physical.tolist() if dry_run else None,
+                "failure_reason": failure_reason,
+                "detail": {"failure_reason": failure_reason, "chunks": rotation_samples},
+                "dt": time.perf_counter() - step_t0,
+            })
             break
 
         after_qc = _read_quadcell_y(
@@ -2504,6 +2975,12 @@ def execute_OPD_fixed_plan(
             "before_qc_raw": before_qc["raw"],
             "before_qc_x": before_qc["x"].tolist(),
             "before_qc_y": before_qc["y"].tolist(),
+            "estimate_x_before_step": estimate_x_before_step.tolist(),
+            "physical_x_before_step": (
+                None if physical_x_before_step is None else physical_x_before_step.tolist()
+            ),
+            "estimate_x_after_step": x_estimate.tolist(),
+            "physical_x_after_step": x_physical.tolist() if dry_run else None,
             "after_qc_raw": after_qc["raw"],
             "after_qc_x": after_qc["x"].tolist(),
             "after_qc_y": after_qc["y"].tolist(),
@@ -2522,10 +2999,18 @@ def execute_OPD_fixed_plan(
             "dt": time.perf_counter() - step_t0,
         }
         execution_log.append(entry)
-        log(
-            f"step={step_index}/{len(steps)} actuator={actuator_label} "
-            f"miss={target_miss:.3f} qc_x=({after_qc['x'][0]:.3f},{after_qc['x'][1]:.3f})"
-        )
+        if _should_log_fixed_plan_step(
+            step_index,
+            len(steps),
+            actuator_label,
+            mapping.get("kind"),
+            profile_step_interval,
+            detail,
+        ):
+            log(
+                f"step={step_index}/{len(steps)} actuator={actuator_label} "
+                f"miss={target_miss:.3f} qc_x=({after_qc['x'][0]:.3f},{after_qc['x'][1]:.3f})"
+            )
 
         if detail.get("failure_reason") is not None:
             failure_reason = detail["failure_reason"]
@@ -2552,6 +3037,12 @@ def execute_OPD_fixed_plan(
         base_mirrors=base_mirrors,
         qc_readout_sign=qc_readout_sign,
     )
+    if execution_log and "after_qc_x" not in execution_log[-1]:
+        execution_log[-1].update(
+            after_qc_raw=final_qc["raw"],
+            after_qc_x=final_qc["x"].tolist(),
+            after_qc_y=final_qc["y"].tolist(),
+        )
     final_x_for_report = x_estimate
     final_mirrors = _x_to_mirrors(final_x_for_report, base_mirrors)
     final_OPD = S.OPD_from_variables(final_x_for_report, *base_mirrors)
@@ -2625,6 +3116,13 @@ def execute_OPD_fixed_plan(
         "failure_reason": failure_reason if failure_reason is not None else (None if final_success else final_res.message),
         "success_checks": success_checks,
         "fixed_plan": True,
+        "fixed_plan_substep_log": True,
+        "completion_message": final_res.message,
+        "initial_qc_x": (
+            execution_log[0]["before_qc_x"] if execution_log else final_qc["x"].tolist()
+        ),
+        "initial_estimate_x": S.pack_variables(*base_mirrors).tolist(),
+        "initial_physical_x": S.pack_variables(*base_mirrors).tolist() if dry_run else None,
         "planner_failure_ignored": bool(planner_failure_ignored),
         "planner_failure_reason": planner_failure_reason,
         "needs_final_recenter": bool(not final_qc_within_tolerance),
@@ -2674,6 +3172,7 @@ def execute_OPD_fixed_plan(
         "linear_settle_delay": float(linear_settle_delay),
         "rotation_settle_delay": float(rotation_settle_delay),
         "step_settle_delay": float(step_settle_delay),
+        "profile_step_interval": None if profile_step_interval is None else int(profile_step_interval),
     }
 
     log(
@@ -2697,12 +3196,15 @@ def execute_reflection_count_fixed_plan(
         rotation_calibration=None,
         center_n_tries=4000,
         angle_perturb=1.5,
+        center_retry_angle_scales=S.DEFAULT_CENTER_RETRY_ANGLE_SCALES,
         seed=0,
         u_min=0.1,
         u_max=0.9,
         sigma_edge=0.1,
         final_qc_tolerance=0.5,
         qc_reacquire_limit=3.0,
+        reacquire_stop_mode="window",
+        reacquire_center_tolerance=0.0,
         stage_qc_limit=3.0,
         final_center_qc_safety_limit=3.5,
         final_center_max_axis_splits=80,
@@ -2712,26 +3214,44 @@ def execute_reflection_count_fixed_plan(
         require_target_N_R_estimate_for_reacquire_stop=False,
         require_beam_departure_before_reacquire=True,
         min_reacquire_pulse_fraction=0.0,
+        target_reacquire_extend_until_reacquired=True,
         reacquire_angle_scan_limit=1.0,
         reacquire_scan_samples=1001,
         reacquire_max_first_leg_candidates=50,
         reacquire_stage_max_candidates=24,
         reacquisition_strategy="forced_stage_one_axis",
+        preflight_before_calibration=None,
         forced_stage_samples=41,
         forced_stage_free_angle_regularization=0.02,
         forced_stage_max_nfev=160,
         surface_stage_active_actuators=("M1.dangle", "M2.dangle", "M3.dangle"),
         surface_stage_sweep_actuator="M4.dangle",
         surface_stage_distance_metric="active_3d",
+        surface_stage_match_target_3d=True,
         surface_stage_qc_tolerance=0.05,
         surface_stage_path_qc_limit=2.0,
+        surface_stage_qc_step_tolerance=0.15,
+        surface_stage_angle_fit_qc_tolerance=0.15,
+        surface_stage_qc_overshoot_allowance=0.1,
+        surface_stage_max_chunks_per_step=50,
         surface_stage_sweep_half_span_deg=None,
         surface_stage_sweep_step_deg=0.05,
         surface_stage_sweep_refinement_levels=8,
+        surface_stage_sweep_expand_to_bounds=True,
+        surface_stage_sweep_max_half_span_deg=None,
+        surface_stage_sweep_min_step_deg=1e-4,
         surface_stage_preferred_axis=None,
         surface_stage_line_max_steps_per_side=400,
         surface_stage_line_step_deg=0.1,
         surface_stage_projection_refinement_samples=3,
+        surface_stage_max_path_candidates=2,
+        surface_stage_repair_source_bounds=True,
+        surface_stage_source_repair_n_tries=None,
+        surface_stage_source_repair_angle_perturb=None,
+        surface_stage_stop_after_stage=False,
+        surface_stage_target_jump_include_active_residuals=True,
+        surface_stage_validate_target_sweep=True,
+        surface_stage_learn_rotation_response=True,
         target_center_after_jump=True,
         target_center_u_min=None,
         target_center_u_max=None,
@@ -2743,8 +3263,8 @@ def execute_reflection_count_fixed_plan(
         max_total_steps=300,
         max_rotation_chunk_substeps=20,
         min_rotation_chunk_substeps=1,
-        rotation_settle_delay=0.5,
-        step_settle_delay=0.35,
+        rotation_settle_delay=0.04,
+        step_settle_delay=0.04,
         calibrate_before=True,
         calibration_pulse_substeps=2,
         calibration_repeats=3,
@@ -2755,6 +3275,7 @@ def execute_reflection_count_fixed_plan(
         calibration_recenter_min_improvement=0.01,
         rotation_pulse_calibration=None,
         dry_run=False,
+        dry_run_use_settle_delays=False,
         dry_run_rotation_error=0.10,
         dry_run_signal_strengths=(1.0, 1.0),
         dry_run_pulse_response=None,
@@ -2763,10 +3284,56 @@ def execute_reflection_count_fixed_plan(
         profile_sink=None):
     """Execute a rotation-only reflection-count change with beam reacquisition.
 
-    The topology transition is executed as small calibrated pulses. QC position
-    is not treated as a path constraint until the beam is reacquired with valid
-    signal strength. Once reacquired, a short QC-guided final centering phase is
-    attempted.
+    Surface staging uses the OPD fixed-plan controller to reach each simulated
+    QC endpoint, with a separate overshoot allowance above the planned bound.
+    step_settle_delay is the extra wait between actuator steps; it defaults to
+    0.04 seconds, matching execute_OPD_fixed_plan.
+    The staging rollback guard is surface_stage_path_qc_limit plus
+    surface_stage_qc_overshoot_allowance, not a calibrated detector edge.
+    Planned pulses use calibration_pulse_substeps (or the calibration table's
+    pulse size); feedback chunks may command fewer steps than that pulse size.
+    Without explicit calibration, dry-run physical motion uses an approximate
+    0.0007 degrees per motor step. Explicit dry_run_pulse_response takes
+    precedence, followed by rotation_pulse_calibration and rotation_calibration.
+    The target jump may leave the QCs and stops on valid reacquisition. With
+    reacquire_stop_mode="center_crossing", at least one measured QC x position
+    must hit zero or cross it between consecutive valid samples after departure.
+    Both QCs must still have valid signals within the reacquisition window.
+    reacquire_center_tolerance optionally accepts positions near zero (mm).
+    Lost signal resets the crossing history. If the primary jump reaches its
+    planned angle before reacquiring, it can keep
+    sweeping in the same direction until reacquisition or the pulse budget.
+    max_total_steps limits commanded chunks/pulses, not planner steps.
+    max_rotation_chunk_substeps also caps target-jump commands. A calibrated
+    pulse can be split into smaller commands with QC feedback after each;
+    min_reacquire_pulse_fraction still measures completed calibrated motion.
+    Hardware angles are estimates, not encoder measurements.
+    Surface target jumps validate the first one-axis QC return in both model
+    directions. Reliable staging QC fits refine uncalibrated step response.
+    Staging fits must preserve the source N_R and match both QCs within
+    surface_stage_angle_fit_qc_tolerance (norm in mm). Failed fits stop staging
+    before another actuator move and require an inverse refresh.
+    Dry-run reflection counts use simulated physical angles, not pulse priors.
+    On hardware, QC reacquisition can succeed while the pulse-model N_R is
+    unverified; an optional model mismatch becomes a warning pending inverse
+    refresh, not a failed measured stop. Dry-run count mismatches still fail.
+    target_N_R_reached is a legacy model flag; its source is recorded explicitly.
+    With profile=True, surface planning reports target/staging distances and
+    route-search progress. Routing skips strictly worse-distance candidates
+    only after a fully validated route succeeds; equal-distance ties remain.
+    Surface target centering uses the same narrower random-search retries as
+    trace_reflection_count_surface_family, controlled by center_retry_angle_scales.
+    Surface strategies trace source and target four-corner patches, select the
+    target point nearest the starting angles, then the source stage nearest that
+    target. Surface tracing knobs apply to both sheets; no dense family is built.
+    With surface_stage_match_target_3d, staging first tries the target's exact
+    active angles and solves only the source sweep angle, then refines the
+    nearest QC-feasible stage if necessary. This uses surface_stage_path_qc_limit
+    at the endpoint; surface_stage_qc_tolerance still defines the traced sheets.
+    New surface plans track absolute single-axis angle goals through local QC
+    changes computed from the current fitted state. Their effective QC tolerance
+    is capped at half an estimated motor step to prevent cumulative drift along
+    a centered sheet. This still uses QC feedback, not encoder measurements.
     """
     if profile and profile_sink is None:
         profile_sink = print
@@ -2778,9 +3345,47 @@ def execute_reflection_count_fixed_plan(
             return
         profile_sink(f"[execute_N_R {time.perf_counter() - t0:.3f}s] {message}")
 
+    center_retry_angle_scales = S._normalize_center_retry_angle_scales(center_retry_angle_scales)
+    if (surface_stage_sweep_max_half_span_deg is not None and
+            (not np.isfinite(surface_stage_sweep_max_half_span_deg) or surface_stage_sweep_max_half_span_deg <= 0)):
+        raise ValueError("surface_stage_sweep_max_half_span_deg must be finite and positive.")
+    if not np.isfinite(surface_stage_sweep_min_step_deg) or surface_stage_sweep_min_step_deg < 0:
+        raise ValueError("surface_stage_sweep_min_step_deg must be finite and nonnegative.")
     actuator_map = _merged_actuator_map(actuator_map)
+    explicit_rotation_calibration = set(rotation_calibration or ())
     rotation_calibration = _normalized_rotation_calibration(rotation_calibration)
+    if dry_run and dry_run_pulse_response is None:
+        dry_run_pulse_response = {}
+        for label, estimated_response in rotation_calibration.items():
+            response = {
+                "degrees_per_substep": (
+                    estimated_response if label in explicit_rotation_calibration
+                    else DEFAULT_REFLECTION_DRY_RUN_DEGREES_PER_SUBSTEP
+                ),
+            }
+            if rotation_pulse_calibration:
+                reference_steps = int(abs(rotation_pulse_calibration.get(
+                    "pulse_substeps", calibration_pulse_substeps,
+                )))
+                if reference_steps <= 0:
+                    raise ValueError("execution pulse_substeps must be positive.")
+                for sign, sign_key in ((1, "+"), (-1, "-")):
+                    delta, source = _pulse_response_from_table(
+                        rotation_pulse_calibration, label, sign,
+                        reference_steps, estimated_response,
+                    )
+                    if source == "pulse_calibration":
+                        response[sign_key] = delta
+                        response["pulse_substeps"] = reference_steps
+            dry_run_pulse_response[label] = response
+    requested_rotation_settle_delay = float(rotation_settle_delay)
+    requested_step_settle_delay = float(step_settle_delay)
+    if dry_run and not bool(dry_run_use_settle_delays):
+        rotation_settle_delay = 0.0
+        step_settle_delay = 0.0
     rng = np.random.default_rng(rng_seed)
+    if dry_run:
+        log(f"dry_run_motion_response={dry_run_pulse_response}")
     base_mirrors = (
         np.array(M1, dtype=float),
         np.array(M2, dtype=float),
@@ -2794,6 +3399,7 @@ def execute_reflection_count_fixed_plan(
     reacquisition_strategy = str(reacquisition_strategy)
     valid_reacquisition_strategies = {
         "forced_stage_one_axis",
+        "surface_stage_then_jump",
         "surface_stage_then_refresh",
         "staged_one_axis",
         "direct_scan",
@@ -2803,6 +3409,25 @@ def execute_reflection_count_fixed_plan(
             "reacquisition_strategy must be one of "
             f"{sorted(valid_reacquisition_strategies)}, got {reacquisition_strategy!r}."
         )
+    reacquire_stop_mode = str(reacquire_stop_mode)
+    if reacquire_stop_mode not in {"window", "center_crossing"}:
+        raise ValueError("reacquire_stop_mode must be 'window' or 'center_crossing'.")
+    reacquire_center_tolerance = float(reacquire_center_tolerance)
+    if not np.isfinite(reacquire_center_tolerance) or reacquire_center_tolerance < 0:
+        raise ValueError("reacquire_center_tolerance must be finite and nonnegative.")
+    if not dry_run and (
+            hardware is None or getattr(hardware, "rotation_stages", None) is None or
+            getattr(hardware, "quads", None) is None):
+        raise ValueError("dry_run=False requires hardware=H with .rotation_stages and .quads.")
+    if not np.isfinite(rotation_settle_delay) or rotation_settle_delay < 0:
+        raise ValueError("rotation_settle_delay must be finite and nonnegative.")
+    max_rotation_chunk_substeps = int(max_rotation_chunk_substeps)
+    min_rotation_chunk_substeps = int(min_rotation_chunk_substeps)
+    if not 1 <= min_rotation_chunk_substeps <= max_rotation_chunk_substeps:
+        raise ValueError("Rotation chunk limits must satisfy 1 <= min <= max.")
+    surface_stage_angle_fit_qc_tolerance = float(surface_stage_angle_fit_qc_tolerance)
+    if not np.isfinite(surface_stage_angle_fit_qc_tolerance) or surface_stage_angle_fit_qc_tolerance < 0:
+        raise ValueError("surface_stage_angle_fit_qc_tolerance must be finite and nonnegative.")
 
     def planner_timing_text(plan):
         timing = plan.get("planner_timing") if isinstance(plan, dict) else None
@@ -2817,10 +3442,21 @@ def execute_reflection_count_fixed_plan(
             "stage_jump_scan",
             "target_center_solve",
             "target_center_path",
+            "source_repair",
             "target_solve",
             "source_line_trace",
             "source_sweep_trace",
+            "source_corner_trace",
+            "source_boundary_refinement",
+            "target_line_trace",
+            "target_sweep_trace",
+            "target_corner_trace",
+            "target_boundary_refinement",
+            "target_surface_projection",
+            "stage_target_match",
             "projection",
+            "target_sweep_validation",
+            "candidate_path_validation",
             "candidate_validation",
         )
         parts = []
@@ -2850,15 +3486,19 @@ def execute_reflection_count_fixed_plan(
             actuation_plan_plan.setdefault("target_jump_step", None)
             return mirrors_target_plan, planner_res_plan, actuation_plan_plan
 
-        if reacquisition_strategy == "surface_stage_then_refresh":
+        if reacquisition_strategy in {"surface_stage_then_refresh", "surface_stage_then_jump"}:
+            if surface_stage_qc_overshoot_allowance < 0 or surface_stage_qc_step_tolerance < 0:
+                raise ValueError("Stage QC tolerance and overshoot allowance must be nonnegative.")
             return S.plan_reflection_count_surface_stage(
                 *mirrors,
                 target_N_R=target_N_R,
                 active_actuators=surface_stage_active_actuators,
                 sweep_actuator=surface_stage_sweep_actuator,
                 distance_metric=surface_stage_distance_metric,
+                match_target_active_angles=surface_stage_match_target_3d,
                 stage_qc_tolerance=surface_stage_qc_tolerance,
                 stage_path_qc_limit=surface_stage_path_qc_limit,
+                qc_reacquire_limit=qc_reacquire_limit,
                 sweep_half_span_deg=(
                     reacquire_angle_scan_limit
                     if surface_stage_sweep_half_span_deg is None
@@ -2866,6 +3506,9 @@ def execute_reflection_count_fixed_plan(
                 ),
                 sweep_step_deg=surface_stage_sweep_step_deg,
                 sweep_refinement_levels=surface_stage_sweep_refinement_levels,
+                sweep_expand_to_bounds=surface_stage_sweep_expand_to_bounds,
+                sweep_max_half_span_deg=surface_stage_sweep_max_half_span_deg,
+                sweep_min_step_deg=surface_stage_sweep_min_step_deg,
                 preferred_axis=surface_stage_preferred_axis,
                 line_max_steps_per_side=surface_stage_line_max_steps_per_side,
                 line_step_deg=surface_stage_line_step_deg,
@@ -2873,6 +3516,7 @@ def execute_reflection_count_fixed_plan(
                 u_max=u_max,
                 center_n_tries=center_n_tries,
                 center_angle_perturb=angle_perturb,
+                center_retry_angle_scales=center_retry_angle_scales,
                 center_seed=seed,
                 center_u_min=target_center_u_min,
                 center_u_max=target_center_u_max,
@@ -2882,11 +3526,22 @@ def execute_reflection_count_fixed_plan(
                 center_final_u_tolerance=1e-9,
                 sigma_edge=sigma_edge,
                 projection_refinement_samples=surface_stage_projection_refinement_samples,
+                max_stage_path_candidates=surface_stage_max_path_candidates,
+                repair_source_out_of_bounds=surface_stage_repair_source_bounds,
+                source_repair_n_tries=surface_stage_source_repair_n_tries,
+                source_repair_angle_perturb=surface_stage_source_repair_angle_perturb,
+                execute_target_jump=not bool(surface_stage_stop_after_stage),
+                target_jump_include_active_residuals=surface_stage_target_jump_include_active_residuals,
+                validate_target_sweep=surface_stage_validate_target_sweep,
+                target_sweep_angle_scan_limit=reacquire_angle_scan_limit,
+                target_sweep_scan_samples=reacquire_scan_samples,
+                target_sweep_stop_mode=reacquire_stop_mode,
+                target_sweep_center_tolerance=reacquire_center_tolerance,
                 stage_max_axis_splits=final_center_max_axis_splits,
                 stage_waypoint_depth=final_center_waypoint_depth,
                 stage_motion_samples_per_step=15,
                 stage_fast_motion_samples_per_step=5,
-                profile_callback=(lambda msg: log("planner " + msg)),
+                profile_callback=(lambda msg: log("planner " + msg)) if profile else None,
             )
 
         stage_search_mode = (
@@ -2926,10 +3581,17 @@ def execute_reflection_count_fixed_plan(
         "forced_stage_one_axis",
         "staged_one_axis",
     }
-    surface_stage_then_refresh_strategy = reacquisition_strategy == "surface_stage_then_refresh"
-    preflight_strategy = staged_qc_only_strategy or surface_stage_then_refresh_strategy
+    surface_stage_strategy = reacquisition_strategy in {
+        "surface_stage_then_refresh",
+        "surface_stage_then_jump",
+    }
+    surface_stage_stage_only = bool(surface_stage_strategy and surface_stage_stop_after_stage)
+    preflight_strategy = staged_qc_only_strategy or surface_stage_strategy
+    if preflight_before_calibration is None:
+        preflight_before_calibration = not surface_stage_strategy
+    preflight_before_calibration = bool(preflight_before_calibration)
 
-    if calibrate_before and preflight_strategy:
+    if calibrate_before and preflight_strategy and preflight_before_calibration:
         try:
             _, preflight_res, preflight_plan = plan_reacquisition_from(base_mirrors)
             preflight_failure_reason = preflight_plan.get("failure_reason")
@@ -2944,7 +3606,7 @@ def execute_reflection_count_fixed_plan(
                 "reacquisition_strategy": reacquisition_strategy,
                 "requires_inverse_refresh": False,
                 "qc_only_reacquire_stop": staged_qc_only_strategy,
-                "stage_only_refresh": surface_stage_then_refresh_strategy,
+                "stage_only_refresh": surface_stage_stage_only,
                 "stage_plan": None,
                 "target_jump_step": None,
                 "failure_reason": str(exc),
@@ -2962,6 +3624,9 @@ def execute_reflection_count_fixed_plan(
             execution = {
                 "success": False,
                 "failure_reason": "Planner failed before calibration: " + str(preflight_failure_reason),
+                "completion_status": "failed",
+                "completion_message": str(final_res.message),
+                "warnings": [],
                 "reflection_count_change": True,
                 "reflection_count_reacquisition": True,
                 "rotation_only": True,
@@ -2969,7 +3634,7 @@ def execute_reflection_count_fixed_plan(
                 "reacquisition_strategy": reacquisition_strategy,
                 "requires_inverse_refresh": False,
                 "suggested_next_step": None,
-                "stage_only_refresh": surface_stage_then_refresh_strategy,
+                "stage_only_refresh": surface_stage_stage_only,
                 "stage_reached": False,
                 "target_N_R_reached": False,
                 "calibration_result": None,
@@ -3023,6 +3688,9 @@ def execute_reflection_count_fixed_plan(
             execution = {
                 "success": False,
                 "failure_reason": "Calibration failed: " + str(calibration_result["failure_reason"]),
+                "completion_status": "failed",
+                "completion_message": str(final_res.message),
+                "warnings": [],
                 "reflection_count_change": True,
                 "rotation_only": True,
                 "target_N_R": int(target_N_R),
@@ -3039,7 +3707,7 @@ def execute_reflection_count_fixed_plan(
         base_mirrors = tuple(np.array(m, dtype=float) for m in calibration_result["calibrated_mirrors"])
         x_estimate = S.pack_variables(*base_mirrors)
         x_physical = np.array(calibration_result["x_physical"], dtype=float)
-        log("calibration complete; planning from post-calibration mirror estimate")
+        log("calibration complete; planning from QC-fitted post-calibration angle estimate (no image refit)")
 
     try:
         mirrors_target, planner_res, actuation_plan = plan_reacquisition_from(base_mirrors)
@@ -3055,8 +3723,11 @@ def execute_reflection_count_fixed_plan(
             "target_N_R": int(target_N_R),
             "reacquisition_strategy": reacquisition_strategy,
             "requires_inverse_refresh": False,
-            "qc_only_reacquire_stop": staged_qc_only_strategy,
-            "stage_only_refresh": surface_stage_then_refresh_strategy,
+            "qc_only_reacquire_stop": bool(
+                staged_qc_only_strategy or
+                (surface_stage_strategy and not surface_stage_stop_after_stage)
+            ),
+            "stage_only_refresh": surface_stage_stage_only,
             "stage_plan": None,
             "target_jump_step": None,
             "failure_reason": str(exc),
@@ -3064,39 +3735,118 @@ def execute_reflection_count_fixed_plan(
         planner_failure_reason = str(exc)
 
     steps = actuation_plan.get("steps", [])
+    center_crossing_required = bool(
+        reacquire_stop_mode == "center_crossing" and any(
+            step.get("target_jump_step", True) and not step.get("disable_reacquire_stop", False)
+            for step in steps
+        )
+    )
     failure_reason = None
     if planner_failure_reason is not None:
         failure_reason = "Planner failed: " + planner_failure_reason
     elif len(steps) == 0:
         start_reflections = S.get_reflection_count(*base_mirrors)
-        if surface_stage_then_refresh_strategy:
+        if surface_stage_stage_only:
             failure_reason = None
         elif start_reflections != int(target_N_R):
             failure_reason = "Planner returned no rotation steps."
 
+    pulse_budget = {"max_total_steps": int(max_total_steps), "nominal_plan_pulses": 0,
+                    "nominal_stage_pulses": 0, "steps": []}
+    execution_pulse_substeps = int(abs(
+        pulse_table.get("pulse_substeps", calibration_pulse_substeps)
+        if isinstance(pulse_table, dict) else calibration_pulse_substeps
+    ))
+    if execution_pulse_substeps <= 0:
+        raise ValueError("execution pulse_substeps must be positive.")
+    for planned_step in steps:
+        label = planned_step.get("actuator")
+        delta = float(planned_step["command_value"])
+        pulse_delta, _ = _pulse_response_from_table(
+            pulse_table, label, int(np.sign(delta) or 1), execution_pulse_substeps,
+            rotation_calibration.get(label, DEFAULT_ROTATION_DEGREES_PER_SUBSTEP),
+        )
+        count = max(1, int(round(abs(delta / pulse_delta)))) if delta else 0
+        pulse_budget["steps"].append(count)
+        pulse_budget["nominal_plan_pulses"] += count
+        if not planned_step.get("target_jump_step", True):
+            pulse_budget["nominal_stage_pulses"] += count
+    pulse_budget["nominal_rotation_settle_seconds"] = (
+        pulse_budget["nominal_plan_pulses"] * float(rotation_settle_delay)
+    )
+    if failure_reason is None and not surface_stage_strategy and pulse_budget["nominal_stage_pulses"] > max_total_steps:
+        failure_reason = (
+            f"Insufficient pulse budget before staging: stage needs "
+            f"{pulse_budget['nominal_stage_pulses']} pulses, max_total_steps={max_total_steps}. "
+            "No staging moves executed; calibration may already have moved the mirrors."
+        )
+    log(
+        f"pulse_budget stage={pulse_budget['nominal_stage_pulses']} "
+        f"full_plan={pulse_budget['nominal_plan_pulses']} limit={max_total_steps} "
+        f"rotation_settle_delay={rotation_settle_delay:g}s per pulse"
+    )
+    execution_start_qc = _read_quadcell_x_with_signal(
+        hardware, dry_run=dry_run, dry_run_x=x_physical, base_mirrors=base_mirrors,
+        qc_readout_sign=qc_readout_sign, qc_min_signal=qc_min_signal,
+        qc_min_signals=qc_min_signals, dry_run_signal_strengths=dry_run_signal_strengths,
+    )
+    initial_model_comparison = _qc_model_comparison(
+        x_estimate, base_mirrors, execution_start_qc, qc_readout_sign
+    )
+    log(
+        f"start QC measured={np.round(execution_start_qc['x'], 4).tolist()} "
+        f"predicted={np.round(initial_model_comparison['predicted_qc_x'], 4).tolist()} "
+        f"residual_norm={initial_model_comparison['qc_residual_norm']:.4g} "
+        f"position_valid={execution_start_qc['valid']}"
+    )
+
     log(
         f"start target_N_R={int(target_N_R)} dry_run={dry_run} "
         f"strategy={reacquisition_strategy} "
+        f"stage_goal_mode={'absolute_angle' if actuation_plan.get('staging_angle_targets') else 'fixed_qc'} "
         f"planned_steps={len(steps)} search_mode={actuation_plan.get('search_mode')} "
         f"qc_reacquire_limit={qc_reacquire_limit} "
+        f"reacquire_stop_mode={reacquire_stop_mode} "
         f"{planner_timing_text(actuation_plan)} failure={failure_reason}"
     )
 
     execution_log = []
     center_execution_log = []
+    execution_warnings = []
     total_commanded_substeps = 0
     total_execution_pulses = 0
     beam_reacquired_during_sweep = False
     beam_departed_reacquire_window = not bool(require_beam_departure_before_reacquire)
     beam_departed_at = None
+    qc_center_crossed_mask = np.zeros(2, dtype=bool)
+    qc_center_crossed_at = [None, None]
+    previous_center_qc_x = None
     reacquired_qc = None
     reacquired_at = None
     last_reacquisition_axis = None
     last_reacquisition_actuator = None
     last_reacquisition_assimilation = None
     last_reacquired_by = None
+    stage_arrival = None
+    track_stage_angles = bool(surface_stage_strategy and actuation_plan.get("staging_angle_targets", False))
     requires_inverse_refresh = False
+    staging_rotation_observations = {}
+    stage_only_refresh = bool(actuation_plan.get("stage_only_refresh", False))
+    execution_t0 = time.perf_counter()
     final_center_path_failure = None
+    stage_step_indices = [
+        index for index, step in enumerate(steps, start=1)
+        if (
+            step.get("reflection_count_surface_stage_move") or
+            step.get("reflection_count_stage_move")
+        )
+    ]
+    last_stage_step_index = max(stage_step_indices) if stage_step_indices else 0
+    stage_reached_during_execution = bool(
+        failure_reason is None and actuation_plan.get("stage_x") is not None and
+        last_stage_step_index == 0 and
+        np.allclose(x_estimate, actuation_plan["stage_x"], rtol=0, atol=1e-9)
+    )
 
     for step_index, step in enumerate(steps, start=1):
         if failure_reason is not None:
@@ -3116,6 +3866,8 @@ def execute_reflection_count_fixed_plan(
         axis_index = int(step["axis_index"])
         planned_angle_delta = float(step["command_value"])
         target_jump_step = bool(step.get("target_jump_step", True))
+        if surface_stage_strategy and (target_jump_step or track_stage_angles) and step.get("mirrors") is not None:
+            planned_angle_delta = float(S.pack_variables(*step["mirrors"])[axis_index] - x_estimate[axis_index])
         target_center_step = bool(step.get("target_center_step", False))
         reacquire_stop_disabled = bool(step.get("disable_reacquire_stop", False))
         qc_only_reacquire_stop = bool(
@@ -3124,6 +3876,47 @@ def execute_reflection_count_fixed_plan(
             not reacquire_stop_disabled
         )
         reacquire_stop_enabled = bool(target_jump_step and not reacquire_stop_disabled)
+        target_jump_sequence_part = step.get("target_jump_sequence_part")
+        extend_target_reacquire_sweep = bool(
+            surface_stage_strategy and
+            target_reacquire_extend_until_reacquired and
+            reacquire_stop_enabled and
+            not target_center_step and
+            target_jump_sequence_part == "sweep"
+        )
+        runtime_sweep_validation = None
+        if surface_stage_strategy and surface_stage_validate_target_sweep and target_jump_sequence_part == "sweep":
+            planned_stage = actuation_plan.get("stage_x")
+            if planned_stage is not None:
+                angle_axes = [1, 3, 5, 7]
+                estimated_error = x_estimate[angle_axes] - np.asarray(planned_stage)[angle_axes]
+                stage_arrival = {"estimated_angle_error_deg": estimated_error.tolist()}
+                if dry_run:
+                    stage_arrival["physical_angle_error_deg"] = (
+                        x_physical[angle_axes] - np.asarray(planned_stage)[angle_axes]).tolist()
+                log(f"stage arrival estimated_angle_error_deg={np.round(estimated_error, 7).tolist()}")
+            validation_x = x_physical if dry_run else x_estimate
+            runtime_sweep_validation = S.scan_reflection_count_sweep_reacquisition(
+                *S.unpack_variables(validation_x, *base_mirrors), target_N_R,
+                sweep_actuator=actuator_label, qc_reacquire_limit=qc_reacquire_limit,
+                angle_scan_limit=reacquire_angle_scan_limit, scan_samples=reacquire_scan_samples,
+                stop_mode=reacquire_stop_mode, center_tolerance=reacquire_center_tolerance,
+                u_min=u_min, u_max=u_max,
+            )
+            expected_source = int(actuation_plan.get("stage_reflections", actuation_plan.get("start_reflections")))
+            if runtime_sweep_validation["start_N_R"] != expected_source or not runtime_sweep_validation["success"]:
+                failure_reason = (
+                    "target_sweep_invalid: staged model does not support a first QC return to "
+                    f"N_R={target_N_R}; source model N_R={runtime_sweep_validation['start_N_R']}, "
+                    f"expected {expected_source}. " + str(runtime_sweep_validation["failure_reason"])
+                )
+                actuation_plan["runtime_target_sweep_validation"] = runtime_sweep_validation
+                log(f"stopped before jump step={step_index}: {failure_reason}")
+                break
+            original_delta = planned_angle_delta
+            planned_angle_delta = float(runtime_sweep_validation["selected"]["angle_delta"])
+            log(f"jump validation actuator={actuator_label} original_delta={original_delta:.6g} "
+                f"validated_delta={planned_angle_delta:.6g} first_return_N_R={target_N_R}")
         degrees_per_substep = rotation_calibration.get(
             actuator_label,
             DEFAULT_ROTATION_DEGREES_PER_SUBSTEP
@@ -3147,6 +3940,8 @@ def execute_reflection_count_fixed_plan(
             execution_pulse_substeps,
             degrees_per_substep,
         )
+        if pulse_source == "fallback_degrees_per_substep" and actuator_label in staging_rotation_observations:
+            pulse_source = "staging_qc_fit"
         if np.sign(pulse_angle_delta) != move_sign:
             failure_reason = (
                 f"Pulse calibration for {actuator_label} has wrong sign: "
@@ -3172,21 +3967,199 @@ def execute_reflection_count_fixed_plan(
             qc_min_signals=qc_min_signals,
             dry_run_signal_strengths=dry_run_signal_strengths,
         )
+        stage_move = bool(
+            not target_jump_step and not target_center_step and (
+                surface_stage_strategy or step.get("reflection_count_stage_move", False)
+            )
+        )
+        stage_limit = surface_stage_path_qc_limit if surface_stage_strategy else stage_qc_limit
+        qc_feedback_stage = bool(stage_move and surface_stage_strategy)
+        if qc_feedback_stage:
+            stage_limit += float(surface_stage_qc_overshoot_allowance)
+        if stage_move:
+            failure_reason = _staging_qc_failure(before_qc, stage_limit)
+            if failure_reason is not None:
+                log(f"stopped before step={step_index}: {failure_reason}")
+                break
+            if qc_feedback_stage:
+                expected_stage_reflections = int(actuation_plan.get("stage_reflections", actuation_plan.get("start_reflections")))
+                start_stage_reflections = int(S.get_reflection_count(*S.unpack_variables(x_estimate, *base_mirrors)))
+                if start_stage_reflections != expected_stage_reflections:
+                    requires_inverse_refresh = True
+                    failure_reason = (
+                        f"stage_model_invalid: before {actuator_label}, estimated N_R={start_stage_reflections} "
+                        f"does not match staging N_R={expected_stage_reflections}. Inverse refresh required."
+                    )
+                    log(f"stopped before step={step_index}: {failure_reason}")
+                    break
 
         remaining_pulses = pulse_count
+        remaining_substeps = pulse_count * execution_pulse_substeps
         pulse_logs = []
         step_commanded_substeps = 0
         step_sim_substeps = 0
+        extra_reacquire_sweep_pulses = 0
         step_t0 = time.perf_counter()
         step_reacquired = False
+        last_jump_progress_t = -np.inf
+        last_jump_stop_state = None
+        x_before_step = x_estimate.copy()
+        physical_x_before_step = x_physical.copy() if dry_run else None
+        current_qc = before_qc
+        stage_detail = None
+        stage_assimilation = None
+        if reacquire_stop_enabled and reacquire_stop_mode == "center_crossing":
+            qc_center_crossed_mask[:] = False
+            qc_center_crossed_at = [None, None]
+            previous_center_qc_x = (
+                before_qc["x"].copy()
+                if before_qc["valid"] and (
+                    not require_beam_departure_before_reacquire or
+                    beam_departed_reacquire_window
+                ) else None
+            )
 
-        while remaining_pulses != 0:
+        if qc_feedback_stage:
+            def read_stage_qc():
+                return _read_quadcell_x_with_signal(
+                    hardware, dry_run=dry_run, dry_run_x=x_physical, base_mirrors=base_mirrors,
+                    qc_readout_sign=qc_readout_sign, qc_min_signal=qc_min_signal,
+                    qc_min_signals=qc_min_signals, dry_run_signal_strengths=dry_run_signal_strengths,
+                )
+
+            def record_stage_sample(sample, qc):
+                sample.update(
+                    pulse=int(sample["chunk"]), elapsed_s=float(time.perf_counter() - execution_t0),
+                    estimate_x_after_pulse=x_estimate.tolist(),
+                    physical_x_after_pulse=x_physical.tolist() if dry_run else None,
+                    qc_signal_strengths=qc["signal_strengths"], qc_signal_valid=bool(qc["valid"]),
+                    qc_signal_thresholds=qc["signal_thresholds"], qc_valid_mask=qc["valid_mask"],
+                    qc_read_error=qc.get("error"),
+                    **_qc_model_comparison(x_estimate, base_mirrors, qc, qc_readout_sign),
+                )
+
+            stage_calibration = dict(rotation_calibration)
+            stage_calibration[actuator_label] = abs(pulse_angle_delta) / execution_pulse_substeps
+            feedback_step = step
+            feedback_tolerance = surface_stage_qc_step_tolerance
+            goal_detail = {"goal_mode": "fixed_qc"}
+            if track_stage_angles:
+                try:
+                    feedback_step, feedback_tolerance, goal_detail = _staging_angle_feedback_step(
+                        step, x_estimate, before_qc["x"], base_mirrors,
+                        qc_readout_sign=qc_readout_sign,
+                        degrees_per_substep=stage_calibration[actuator_label],
+                        qc_step_tolerance=surface_stage_qc_step_tolerance,
+                        qc_safety_limit=stage_limit, expected_reflections=expected_stage_reflections,
+                    )
+                except ValueError as exc:
+                    failure_reason = f"stage_angle_goal_invalid: {exc}. Inverse refresh required."
+                    requires_inverse_refresh = True
+                    log(f"stopped before step={step_index}: {failure_reason}")
+                    break
+            stage_detail = _execute_rotation_step_fixed(
+                feedback_step, mapping, hardware, x_estimate, x_physical, base_mirrors, stage_calibration, rng,
+                dry_run=dry_run, dry_run_rotation_error=dry_run_rotation_error,
+                qc_readout_sign=qc_readout_sign, qc_step_tolerance=feedback_tolerance,
+                qc_safety_limit=stage_limit, fast_qc_avg=1, fast_qc_delay=0,
+                max_rotation_chunks_per_step=max(0, min(
+                    int(surface_stage_max_chunks_per_step), int(max_total_steps - total_execution_pulses))),
+                max_rotation_chunk_substeps=max_rotation_chunk_substeps,
+                min_rotation_chunk_substeps=min_rotation_chunk_substeps,
+                rotation_settle_delay=rotation_settle_delay,
+                qc_reader=read_stage_qc, sample_callback=record_stage_sample,
+                dry_run_delta=lambda n: _dry_run_rotation_delta_for_steps(
+                    actuator_label, n, rotation_calibration, rng,
+                    dry_run_rotation_error=dry_run_rotation_error,
+                    dry_run_pulse_response=dry_run_pulse_response,
+                    pulse_substeps=execution_pulse_substeps,
+                ),
+                stop_on_target_crossing=True,
+            )
+            stage_detail.update(goal_detail)
+            pulse_logs = stage_detail["chunks"]
+            step_commanded_substeps = stage_detail["total_commanded_substeps"]
+            step_sim_substeps = stage_detail["total_sim_substeps"]
+            total_commanded_substeps += step_commanded_substeps
+            total_execution_pulses += len(pulse_logs)
+            failure_reason = stage_detail["failure_reason"]
+            if stage_detail["stop_reason"] == "max_rotation_chunks_reached":
+                failure_reason = "stage_feedback_budget: QC endpoint not reached within the chunk/pulse budget."
+            chunk_qc = read_stage_qc()
+            remaining_pulses = 0
+            remaining_substeps = 0
+            if failure_reason is None and not chunk_qc["valid"]:
+                failure_reason = "stage_qc_invalid: " + _qc_invalid_details(chunk_qc) + " after staging move."
+            if failure_reason is None and dry_run:
+                physical_reflections = int(S.get_reflection_count(*S.unpack_variables(x_physical, *base_mirrors)))
+                if physical_reflections != expected_stage_reflections:
+                    failure_reason = (
+                        f"stage_reflection_count_changed: simulated physical N_R={physical_reflections} "
+                        f"after {actuator_label}, expected {expected_stage_reflections}."
+                    )
+            if failure_reason is None and chunk_qc["valid"]:
+                try:
+                    fitted, stage_assimilation = _assimilate_staging_rotation_from_qc(
+                        x_estimate, x_before_step, feedback_step, chunk_qc["x"], base_mirrors,
+                        expected_reflections=expected_stage_reflections,
+                        qc_readout_sign=qc_readout_sign, max_fit_error=surface_stage_angle_fit_qc_tolerance,
+                    )
+                    if not stage_assimilation["accepted"]:
+                        failure_reason = "stage_angle_fit_invalid: " + stage_assimilation["message"] + " Inverse refresh required."
+                    else:
+                        x_estimate[:] = fitted
+                        if track_stage_angles:
+                            stage_detail["axis_angle_error_after_deg"] = float(
+                                fitted[axis_index] - goal_detail["target_angle_deg"])
+                    observed_delta = float(fitted[axis_index] - x_before_step[axis_index])
+                    if (
+                            stage_assimilation["accepted"] and
+                            surface_stage_learn_rotation_response and
+                            actuator_label not in explicit_rotation_calibration and
+                            pulse_source in {"fallback_degrees_per_substep", "staging_qc_fit"} and
+                            abs(step_sim_substeps) >= 3 and stage_assimilation["success"] and
+                            stage_assimilation["fit_error_norm"] <= surface_stage_qc_step_tolerance and
+                            observed_delta * step_sim_substeps > 0 and
+                            S.get_reflection_count(*S.unpack_variables(fitted, *base_mirrors)) ==
+                            int(actuation_plan.get("stage_reflections", actuation_plan.get("start_reflections")))):
+                        observed = abs(observed_delta / step_sim_substeps)
+                        if np.isfinite(observed):
+                            observations = staging_rotation_observations.setdefault(actuator_label, [])
+                            observations.append(observed)
+                            rotation_calibration[actuator_label] = float(np.median(observations))
+                            stage_assimilation["observed_degrees_per_substep"] = observed
+                            log(f"stage response actuator={actuator_label} "
+                                f"degrees_per_substep={rotation_calibration[actuator_label]:.6g} source=QC_fit")
+                except Exception as exc:
+                    stage_assimilation = {"success": False, "message": str(exc)}
+                    failure_reason = f"stage_angle_fit_invalid: {exc}. Inverse refresh required."
+
+        while (
+                not qc_feedback_stage and
+                (
+                    remaining_substeps != 0 or
+                    (extend_target_reacquire_sweep and not step_reacquired)
+                )):
             if total_execution_pulses >= max_total_steps:
-                failure_reason = f"Reached max_total_steps={max_total_steps} pulses."
+                failure_reason = (
+                    f"Reached max_total_steps={max_total_steps} pulses during "
+                    f"step {step_index}/{len(steps)} ({actuator_label}); "
+                    f"{len(pulse_logs)}/{abs(pulse_count)} pulses executed in this step."
+                )
                 break
 
-            sim_steps = int(np.sign(remaining_pulses) * execution_pulse_substeps)
+            extending_reacquire_sweep = extra_reacquire_sweep_pulses > 0
+            if remaining_substeps == 0:
+                remaining_substeps = move_sign * execution_pulse_substeps
+                extra_reacquire_sweep_pulses += 1
+                extending_reacquire_sweep = True
+
+            chunk_substeps = min(
+                abs(remaining_substeps), execution_pulse_substeps, max_rotation_chunk_substeps,
+            )
+            sim_steps = int(np.sign(remaining_substeps) * chunk_substeps)
             hardware_steps = hardware_direction * sim_steps
+            command_angle_delta = pulse_angle_delta * chunk_substeps / execution_pulse_substeps
 
             if dry_run:
                 actual_delta = _dry_run_rotation_delta_for_steps(
@@ -3205,8 +4178,9 @@ def execute_reflection_count_fixed_plan(
                     break
                 hardware.rotation_stages.move_relative_steps(controller, actuator, hardware_steps)
 
-            x_estimate[axis_index] += pulse_angle_delta
-            remaining_pulses -= int(np.sign(remaining_pulses))
+            x_estimate[axis_index] += command_angle_delta
+            remaining_substeps -= sim_steps
+            remaining_pulses = remaining_substeps / execution_pulse_substeps
             step_commanded_substeps += hardware_steps
             step_sim_substeps += sim_steps
             total_commanded_substeps += hardware_steps
@@ -3226,11 +4200,27 @@ def execute_reflection_count_fixed_plan(
                 dry_run_signal_strengths=dry_run_signal_strengths,
             )
             estimated_mirrors = S.unpack_variables(x_estimate, *base_mirrors)
+            current_qc = chunk_qc
+            estimate_reflection_count = int(S.get_reflection_count(*estimated_mirrors))
+            simulation_reflection_count = (
+                int(S.get_reflection_count(*S.unpack_variables(x_physical, *base_mirrors)))
+                if dry_run else estimate_reflection_count
+            )
             pulse_log = {
+                "elapsed_s": float(time.perf_counter() - execution_t0),
+                "estimate_x_after_pulse": x_estimate.tolist(),
+                "physical_x_after_pulse": x_physical.tolist() if dry_run else None,
+                "qc_normalized_x": chunk_qc.get("normalized_x"),
+                "qc_read_error": chunk_qc.get("error"),
+                **_qc_model_comparison(x_estimate, base_mirrors, chunk_qc, qc_readout_sign),
                 "pulse": len(pulse_logs) + 1,
                 "hardware_steps": int(hardware_steps),
                 "sim_steps": int(sim_steps),
-                "pulse_angle_delta": float(pulse_angle_delta),
+                "pulse_angle_delta": float(command_angle_delta),
+                "nominal_pulse_angle_delta": float(pulse_angle_delta),
+                "calibration_pulses_completed": abs(step_sim_substeps) / execution_pulse_substeps,
+                "extra_reacquire_sweep_pulse": bool(extending_reacquire_sweep),
+                "extra_reacquire_sweep_pulse_count": int(extra_reacquire_sweep_pulses),
                 "expected_angle_after_pulse": float(x_estimate[axis_index]),
                 "estimated_angle": float(x_estimate[axis_index]),
                 "qc_x": chunk_qc["x"].tolist(),
@@ -3238,9 +4228,26 @@ def execute_reflection_count_fixed_plan(
                 "qc_signal_strengths": chunk_qc["signal_strengths"],
                 "qc_signal_valid": bool(chunk_qc["valid"]),
                 "qc_valid_mask": chunk_qc["valid_mask"],
-                "sim_reflection_count": int(S.get_reflection_count(*estimated_mirrors)),
+                "sim_reflection_count": simulation_reflection_count,
+                "angle_estimate_reflection_count": estimate_reflection_count,
                 "sim_OPD": float(S.OPD_from_variables(x_estimate, *base_mirrors)),
             }
+            if stage_move:
+                failure_reason = _staging_qc_failure(chunk_qc, stage_limit)
+                if failure_reason is not None:
+                    pulse_log["failure_reason"] = failure_reason
+            # Loss of signal (or a clipped position) is also a departure. It
+            # must not stop the target sweep before it can regain the beam.
+            if target_jump_step and not chunk_qc["valid"]:
+                if not beam_departed_reacquire_window:
+                    beam_departed_at = {
+                        "execution_step": int(step_index), "pulse": len(pulse_logs) + 1,
+                        "actuator": actuator_label, "qc_x": chunk_qc["x"].tolist(),
+                        "reason": "qc_invalid_or_saturated",
+                    }
+                beam_departed_reacquire_window = True
+                pulse_log["beam_departed_reacquire_window"] = True
+                pulse_log["beam_departure_seen"] = True
             if chunk_qc["valid"]:
                 pulse_log["qc_reacquire_max_abs"] = float(np.max(np.abs(chunk_qc["x"])))
                 pulse_log["qc_in_reacquire_window"] = (
@@ -3255,7 +4262,7 @@ def execute_reflection_count_fixed_plan(
                 pulse_log["min_reacquire_pulses"] = int(min_reacquire_pulses)
                 pulse_log["step_pulses_completed"] = int(len(pulse_logs) + 1)
                 pulse_log["past_min_reacquire_pulses"] = (
-                    pulse_log["step_pulses_completed"] >= int(min_reacquire_pulses)
+                    abs(step_sim_substeps) >= int(min_reacquire_pulses) * execution_pulse_substeps
                 )
                 pulse_log["target_jump_step"] = bool(target_jump_step)
                 pulse_log["target_center_step"] = bool(target_center_step)
@@ -3289,15 +4296,50 @@ def execute_reflection_count_fixed_plan(
                     pulse_log["target_N_R_estimate_reached"]
                 )
                 pulse_log["reacquire_target_estimate_ok"] = bool(target_estimate_ok)
+                if reacquire_stop_enabled and reacquire_stop_mode == "center_crossing":
+                    if departure_ok:
+                        centered = np.abs(chunk_qc["x"]) <= reacquire_center_tolerance
+                        crossed = np.zeros(2, dtype=bool)
+                        if previous_center_qc_x is not None:
+                            crossed = np.sign(previous_center_qc_x) * np.sign(chunk_qc["x"]) < 0
+                        if pulse_log["past_min_reacquire_pulses"]:
+                            for qc_index in range(2):
+                                if not qc_center_crossed_mask[qc_index] and (centered[qc_index] or crossed[qc_index]):
+                                    qc_center_crossed_mask[qc_index] = True
+                                    qc_center_crossed_at[qc_index] = {
+                                        "execution_step": int(step_index),
+                                        "pulse": int(len(pulse_logs) + 1),
+                                        "actuator": actuator_label,
+                                        "previous_qc_x": (
+                                            None if previous_center_qc_x is None
+                                            else float(previous_center_qc_x[qc_index])
+                                        ),
+                                        "qc_x": float(chunk_qc["x"][qc_index]),
+                                        "crossed_zero": bool(crossed[qc_index]),
+                                    }
+                        previous_center_qc_x = chunk_qc["x"].copy()
+                    else:
+                        previous_center_qc_x = None
+                center_stop_ok = bool(
+                    reacquire_stop_mode == "window" or np.any(qc_center_crossed_mask)
+                )
+                pulse_log["reacquire_center_stop_ok"] = center_stop_ok
                 if (
                     reacquire_stop_enabled and
                     pulse_log["qc_in_reacquire_window"] and
                     departure_ok and
                     pulse_log["past_min_reacquire_pulses"] and
-                    target_estimate_ok
+                    target_estimate_ok and
+                    center_stop_ok
                 ):
                     pulse_log["reacquired"] = True
-                    if qc_only_reacquire_stop:
+                    if reacquire_stop_mode == "center_crossing":
+                        pulse_log["reacquired_by"] = (
+                            "departed_then_qc_center_crossing"
+                            if require_beam_departure_before_reacquire
+                            else "qc_center_crossing"
+                        )
+                    elif qc_only_reacquire_stop:
                         pulse_log["reacquired_by"] = (
                             "departed_then_qc_only"
                             if require_beam_departure_before_reacquire
@@ -3309,7 +4351,7 @@ def execute_reflection_count_fixed_plan(
                             if pulse_log["target_N_R_estimate_reached"]
                             else "departed_then_qc_only"
                         )
-                    if qc_only_reacquire_stop:
+                    if qc_only_reacquire_stop or reacquire_stop_mode == "center_crossing":
                         requires_inverse_refresh = True
                     step_reacquired = True
                     beam_reacquired_during_sweep = True
@@ -3322,12 +4364,65 @@ def execute_reflection_count_fixed_plan(
                     last_reacquisition_axis = axis_index
                     last_reacquisition_actuator = actuator_label
                     last_reacquired_by = pulse_log["reacquired_by"]
+                    if runtime_sweep_validation is not None and simulation_reflection_count != int(target_N_R):
+                        if dry_run or require_target_N_R_estimate_for_reacquire_stop:
+                            failure_reason = (
+                                "target_not_reached_on_reacquisition: stopped on QC return, but "
+                                f"{'simulated physical' if dry_run else 'estimated'} N_R={simulation_reflection_count} "
+                                f"does not match target {target_N_R}. Inverse refresh required."
+                            )
+                            pulse_log["failure_reason"] = failure_reason
+                        else:
+                            warning = (
+                                "target_N_R_unverified: measured QC reacquired, but pulse-based "
+                                f"N_R estimate={simulation_reflection_count} differs from target {target_N_R}. "
+                                "Inverse refresh required to verify reflection count."
+                            )
+                            requires_inverse_refresh = True
+                            execution_warnings.append(warning)
+                            pulse_log["reacquisition_warning"] = warning
+                            log("warning " + warning)
+            elif reacquire_stop_enabled and reacquire_stop_mode == "center_crossing":
+                # A sign flip across lost signal is not a measured center crossing.
+                previous_center_qc_x = None
+                qc_center_crossed_mask[:] = False
+                qc_center_crossed_at = [None, None]
+            if reacquire_stop_enabled and reacquire_stop_mode == "center_crossing":
+                pulse_log["qc_center_crossed_mask"] = qc_center_crossed_mask.tolist()
+            if reacquire_stop_enabled:
+                blockers = []
+                if not chunk_qc["valid"]:
+                    blockers.append("qc_signal_invalid")
+                elif not pulse_log["qc_in_reacquire_window"]:
+                    blockers.append("outside_qc_window")
+                if require_beam_departure_before_reacquire and not beam_departed_reacquire_window:
+                    blockers.append("departure_not_seen")
+                if abs(step_sim_substeps) < int(min_reacquire_pulses) * execution_pulse_substeps:
+                    blockers.append("minimum_motion_not_reached")
+                if require_target_N_R_estimate_for_reacquire_stop and not pulse_log.get("target_N_R_estimate_reached", False):
+                    blockers.append("target_N_R_estimate_not_reached")
+                if reacquire_stop_mode == "center_crossing" and not np.any(qc_center_crossed_mask):
+                    blockers.append("center_crossing_not_seen")
+                pulse_log["reacquire_stop_blockers"] = blockers
+                progress_state = (tuple(blockers), tuple(qc_center_crossed_mask))
+                now = time.perf_counter()
+                if profile and (step_reacquired or progress_state != last_jump_stop_state or now - last_jump_progress_t >= 1.0):
+                    log(
+                        f"jump step={step_index}/{len(steps)} actuator={actuator_label} "
+                        f"command={len(pulse_logs) + 1} substeps={sim_steps} "
+                        f"calibration_pulses={abs(step_sim_substeps) / execution_pulse_substeps:g}/{min_reacquire_pulses} minimum "
+                        f"qc_x=({chunk_qc['x'][0]:.3f},{chunk_qc['x'][1]:.3f}) "
+                        f"signals={chunk_qc['signal_strengths']} valid_mask={chunk_qc['valid_mask']} "
+                        f"N_R_model={estimate_reflection_count} "
+                        f"N_R_simulated_physical={simulation_reflection_count if dry_run else 'unavailable'} "
+                        f"crossed={qc_center_crossed_mask.tolist()} "
+                        f"wait={','.join(blockers) if blockers else 'none'} stopped={step_reacquired}"
+                    )
+                    last_jump_progress_t = now
+                    last_jump_stop_state = progress_state
             pulse_logs.append(pulse_log)
-            if step_reacquired:
+            if step_reacquired or failure_reason is not None:
                 break
-
-        if failure_reason is not None:
-            break
 
         after_qc = (
             chunk_qc if len(pulse_logs) > 0
@@ -3355,7 +4450,22 @@ def execute_reflection_count_fixed_plan(
                 include_edge_ends=False,
             )
 
+        command_sizes = [abs(int(pulse["hardware_steps"])) for pulse in pulse_logs]
+        command_size_min = min(command_sizes, default=0)
+        command_size_max = max(command_sizes, default=0)
+        step_rollbacks = sum(bool(pulse.get("rolled_back")) for pulse in pulse_logs)
         entry = {
+            "completed": bool(remaining_pulses == 0 and failure_reason is None),
+            "stage_control_mode": "qc_endpoint_feedback" if qc_feedback_stage else None,
+            "stage_feedback": stage_detail,
+            "stage_assimilation": stage_assimilation,
+            "stage_angle_fit_accepted": stage_assimilation.get("accepted", False) if stage_assimilation is not None else None,
+            "failure_reason": failure_reason,
+            "remaining_pulses": float(remaining_pulses),
+            "remaining_substeps": int(remaining_substeps),
+            "estimate_x_before_step": x_before_step.tolist(),
+            "physical_x_before_step": physical_x_before_step.tolist() if dry_run else None,
+            **_qc_model_comparison(x_estimate, base_mirrors, after_qc, qc_readout_sign),
             "execution_step": step_index,
             "planner_step": step.get("step"),
             "phase": (
@@ -3369,7 +4479,15 @@ def execute_reflection_count_fixed_plan(
             "target_center_step": bool(target_center_step),
             "reacquire_stop_disabled": bool(reacquire_stop_disabled),
             "qc_only_reacquire_stop": bool(qc_only_reacquire_stop),
+            "reacquire_stop_mode": reacquire_stop_mode,
+            "qc_center_crossed_mask": qc_center_crossed_mask.tolist(),
+            "qc_center_crossed_at": qc_center_crossed_at,
+            "target_jump_sequence_part": target_jump_sequence_part,
+            "target_sweep_validation": runtime_sweep_validation,
+            "target_reacquire_extension_enabled": bool(extend_target_reacquire_sweep),
+            "extra_reacquire_sweep_pulses": int(extra_reacquire_sweep_pulses),
             "planned_angle_delta": planned_angle_delta,
+            "planned_path_angle_delta": float(step["command_value"]),
             "command_value": planned_angle_delta,
             "degrees_per_substep": float(degrees_per_substep),
             "pulse_response_source": pulse_source,
@@ -3380,6 +4498,13 @@ def execute_reflection_count_fixed_plan(
             "min_reacquire_pulse_fraction": float(min_reacquire_pulse_fraction),
             "pulse_count": int(pulse_count),
             "executed_pulse_count": int(len(pulse_logs)),
+            "command_chunk_substeps_min": command_size_min,
+            "command_chunk_substeps_max": command_size_max,
+            "rollback_count": step_rollbacks,
+            "executed_angle_delta_estimate": float(x_estimate[axis_index] - x_before_step[axis_index]),
+            "remaining_angle_delta_estimate": float(
+                planned_angle_delta - (x_estimate[axis_index] - x_before_step[axis_index])
+            ),
             "expected_angle_moved": float(expected_angle_moved),
             "residual_angle_after_pulse_rounding": float(residual_angle),
             "total_commanded_substeps": int(step_commanded_substeps),
@@ -3402,16 +4527,37 @@ def execute_reflection_count_fixed_plan(
             "dt": time.perf_counter() - step_t0,
         }
         execution_log.append(entry)
+        extra_sweep_text = (
+            f" extra_reacquire_pulses={extra_reacquire_sweep_pulses}"
+            if extra_reacquire_sweep_pulses else
+            ""
+        )
         log(
             f"step={step_index}/{len(steps)} actuator={actuator_label} "
             f"planned_pulses={pulse_count} executed_pulses={len(pulse_logs)} "
             f"substeps={step_commanded_substeps} "
+            f"nominal_pulse_substeps={execution_pulse_substeps} "
+            f"chunk_substeps={command_size_min}..{command_size_max} rollbacks={step_rollbacks} "
             f"residual_angle={residual_angle:.4g} "
             f"qc_valid={after_qc['valid']} "
             f"qc_x=({after_qc['x'][0]:.3f},{after_qc['x'][1]:.3f}) "
-            f"N_R_sim={estimate_metrics['reflection_count']} "
-            f"departed={beam_departed_reacquire_window} reacquired={step_reacquired}"
+            f"{'N_R_simulated_physical' if dry_run else 'N_R_model'}="
+            f"{(physical_metrics if dry_run else estimate_metrics)['reflection_count']} "
+            f"N_R_angle_estimate={estimate_metrics['reflection_count']} "
+            f"model_qc_residual={entry['qc_residual_norm']:.4g} "
+            f"stage_stop={stage_detail.get('stop_reason') if stage_detail else None} "
+            f"stage_fit_accepted={entry['stage_angle_fit_accepted']} "
+            f"departed={beam_departed_reacquire_window} reacquired={step_reacquired} "
+            f"failure={failure_reason}{extra_sweep_text}"
         )
+        if failure_reason is not None:
+            break
+        if (
+                failure_reason is None and
+                last_stage_step_index > 0 and
+                step_index >= last_stage_step_index and
+                not target_jump_step):
+            stage_reached_during_execution = True
         if step_reacquired:
             if requires_inverse_refresh:
                 entry["reacquisition_assimilation_skipped"] = "requires_inverse_refresh"
@@ -3456,6 +4602,7 @@ def execute_reflection_count_fixed_plan(
         beam_reacquired_now = bool(
             current_qc["valid"] and
             float(np.max(np.abs(current_qc["x"]))) <= float(qc_reacquire_limit) and
+            (not center_crossing_required or beam_reacquired_during_sweep) and
             (
                 stage_only_refresh or
                 not require_beam_departure_before_reacquire or
@@ -3476,10 +4623,27 @@ def execute_reflection_count_fixed_plan(
                     "beam_not_reacquired: beam never left the "
                     f"+/-{qc_reacquire_limit} mm reacquisition window."
                 )
+            elif center_crossing_required and not beam_reacquired_during_sweep:
+                failure_reason = (
+                    "beam_not_centered: at least one quadcell must hit or cross x=0 "
+                    "with valid signal and the required reacquisition conditions "
+                    f"during the target sweep (crossed={qc_center_crossed_mask.tolist()})."
+                )
             else:
                 failure_reason = (
                     "beam_not_reacquired: QC did not become valid within "
                     f"+/-{qc_reacquire_limit} mm during reacquisition sweep."
+                )
+        elif (
+                not requires_inverse_refresh and
+                bool(actuation_plan.get("qc_only_reacquire_stop", False)) and
+                any(entry.get("target_jump_step", False) for entry in execution_log)):
+            requires_inverse_refresh = True
+            if last_reacquired_by is None:
+                last_reacquired_by = (
+                    "departed_then_qc_only"
+                    if require_beam_departure_before_reacquire else
+                    "qc_only"
                 )
 
     if failure_reason is None and final_center_after_reacquire and not requires_inverse_refresh:
@@ -3864,13 +5028,14 @@ def execute_reflection_count_fixed_plan(
         qc_min_signals=qc_min_signals,
         dry_run_signal_strengths=dry_run_signal_strengths,
     )
-    final_mirrors = S.unpack_variables(x_estimate, *base_mirrors)
+    final_x = x_physical if dry_run else x_estimate
+    final_mirrors = S.unpack_variables(final_x, *base_mirrors)
     final_res = S.set_OPD_result_full_x(
         SimpleNamespace(success=False, message=""),
         *final_mirrors
     )
-    final_OPD = S.OPD_from_variables(x_estimate, *base_mirrors)
-    final_sim_qc = S.quadcell_errors_from_variables(x_estimate, *base_mirrors)
+    final_OPD = S.OPD_from_variables(final_x, *base_mirrors)
+    final_sim_qc = S.quadcell_errors_from_variables(final_x, *base_mirrors)
     final_sim_reflections = S.get_reflection_count(*final_mirrors)
     final_qc_max_abs = float(np.max(np.abs(final_qc["x"])))
     final_qc_centered = final_qc_max_abs <= float(final_qc_tolerance)
@@ -3880,10 +5045,13 @@ def execute_reflection_count_fixed_plan(
     )
     target_reflection_sim_reached = int(final_sim_reflections) == int(target_N_R)
     stage_reached = bool(
-        stage_only_refresh and
-        int(final_sim_reflections) == int(actuation_plan.get("stage_reflections", final_sim_reflections)) and
-        final_qc["valid"] and
-        final_qc_max_abs <= float(qc_reacquire_limit)
+        stage_reached_during_execution or
+        (
+            failure_reason is None and stage_only_refresh and
+            int(final_sim_reflections) == int(actuation_plan.get("stage_reflections", final_sim_reflections)) and
+            final_qc["valid"] and
+            final_qc_max_abs <= float(qc_reacquire_limit)
+        )
     )
 
     if failure_reason is None and not beam_reacquired:
@@ -3905,23 +5073,32 @@ def execute_reflection_count_fixed_plan(
                 "beam_not_centered: final centering did not run and final QC "
                 f"max abs {final_qc_max_abs:.4g} exceeds {final_qc_tolerance}."
             )
-    if failure_reason is None and not requires_inverse_refresh and not target_reflection_sim_reached:
+    if failure_reason is None and (not requires_inverse_refresh or (dry_run and not stage_only_refresh)) and not target_reflection_sim_reached:
         failure_reason = (
             f"simulated reflection count {final_sim_reflections} != target {target_N_R}."
         )
 
     final_success = failure_reason is None
+    if not final_success and (total_execution_pulses > 0 or calibration_result is not None):
+        requires_inverse_refresh = True
     final_res.success = bool(final_success)
+    completion_status = "failed"
     if final_success and stage_only_refresh:
+        completion_status = "staged_pending_inverse_refresh"
         final_res.message = (
             "Surface staging point reached; inverse refresh required before "
             "the target reflection-count jump."
         )
+    elif final_success and dry_run:
+        completion_status = "completed_in_simulation"
+        final_res.message = f"Dry run completed with simulated physical N_R={final_sim_reflections}."
     elif final_success and requires_inverse_refresh:
+        completion_status = "reacquired_pending_inverse_refresh"
         final_res.message = (
-            "Reflection-count execution reacquired QC signal; inverse refresh required."
+            f"QC reacquired; target N_R={target_N_R} is unverified until inverse refresh."
         )
     elif final_success:
+        completion_status = "completed"
         final_res.message = "Reflection-count execution reacquired centered QC signal."
     else:
         final_res.message = "Reflection-count execution stopped before success criteria were met."
@@ -3929,6 +5106,9 @@ def execute_reflection_count_fixed_plan(
     execution = {
         "success": bool(final_success),
         "failure_reason": failure_reason,
+        "completion_status": completion_status,
+        "completion_message": str(final_res.message),
+        "warnings": execution_warnings,
         "reflection_count_change": True,
         "reflection_count_reacquisition": True,
         "rotation_only": True,
@@ -3936,8 +5116,11 @@ def execute_reflection_count_fixed_plan(
         "target_N_R": int(target_N_R),
         "reacquisition_strategy": reacquisition_strategy,
         "stage_only_refresh": bool(stage_only_refresh),
-        "stage_reached": bool(stage_reached and final_success),
+        "stage_reached": bool(stage_reached),
+        "stage_arrival": stage_arrival,
+        "staging_angle_targets": bool(track_stage_angles),
         "target_N_R_reached": bool(target_reflection_sim_reached),
+        "target_N_R_reached_source": "simulated_physical" if dry_run else "angle_estimate",
         "stage_plan": actuation_plan.get("stage_plan"),
         "target_jump_step": actuation_plan.get("target_jump_step"),
         "target_center_after_jump": bool(target_center_after_jump),
@@ -3948,6 +5131,8 @@ def execute_reflection_count_fixed_plan(
         "target_center_plan": actuation_plan.get("target_center_plan"),
         "requires_inverse_refresh": bool(requires_inverse_refresh),
         "suggested_next_step": (
+            "recover valid QC signal, take light/dark images and run optimize_inverse before replanning"
+            if requires_inverse_refresh and not final_success else
             actuation_plan.get(
                 "suggested_next_step",
                 "take light/dark images and run optimize_inverse"
@@ -3955,9 +5140,15 @@ def execute_reflection_count_fixed_plan(
             if requires_inverse_refresh else None
         ),
         "reacquired_by": last_reacquired_by,
+        "reacquire_stop_mode": reacquire_stop_mode,
+        "reacquire_center_tolerance": float(reacquire_center_tolerance),
+        "qc_center_crossing_required": bool(center_crossing_required),
+        "qc_center_crossed_mask": qc_center_crossed_mask.tolist(),
+        "qc_center_crossed_at": qc_center_crossed_at,
         "final_sim_reflection_count": int(final_sim_reflections),
+        "final_angle_estimate_reflection_count": int(S.get_reflection_count(*S.unpack_variables(x_estimate, *base_mirrors))),
         "target_reflection_sim_reached": bool(target_reflection_sim_reached),
-        "reflection_count_verified": False,
+        "reflection_count_verified": bool(dry_run),
         "beam_reacquired": bool(beam_reacquired),
         "beam_reacquired_during_sweep": bool(beam_reacquired_during_sweep),
         "require_beam_departure_before_reacquire": bool(require_beam_departure_before_reacquire),
@@ -3986,8 +5177,18 @@ def execute_reflection_count_fixed_plan(
         "target_mirrors": _mirrors_to_lists(mirrors_target),
         "total_commanded_substeps": int(total_commanded_substeps),
         "total_execution_pulses": int(total_execution_pulses),
+        "pulse_budget": pulse_budget,
+        "execution_elapsed_s": float(time.perf_counter() - execution_t0),
+        "initial_model_comparison": initial_model_comparison,
+        "final_model_comparison": _qc_model_comparison(x_estimate, base_mirrors, final_qc, qc_readout_sign),
+        "angle_trajectory_source": "simulated_physical" if dry_run else "calibrated_pulse_estimate",
+        "final_qc_position_saturated": bool(final_qc.get("position_saturated", False)),
         "rotation_calibration": dict(rotation_calibration),
+        "staging_rotation_observations": staging_rotation_observations,
+        "surface_stage_validate_target_sweep": bool(surface_stage_validate_target_sweep),
+        "surface_stage_learn_rotation_response": bool(surface_stage_learn_rotation_response),
         "calibrate_before": bool(calibrate_before),
+        "preflight_before_calibration": bool(preflight_before_calibration),
         "calibration_pulse_substeps": int(calibration_pulse_substeps),
         "calibration_repeats": int(calibration_repeats),
         "calibration_recenter_after": bool(calibration_recenter_after),
@@ -4004,6 +5205,7 @@ def execute_reflection_count_fixed_plan(
         "planner_timing": actuation_plan.get("planner_timing"),
         "planner_result": planner_res,
         "dry_run": bool(dry_run),
+        "dry_run_use_settle_delays": bool(dry_run_use_settle_delays),
         "qc_min_signal": float(qc_min_signal),
         "qc_min_signals": (
             None if qc_min_signals is None
@@ -4024,6 +5226,8 @@ def execute_reflection_count_fixed_plan(
         ),
         "rotation_settle_delay": float(rotation_settle_delay),
         "step_settle_delay": float(step_settle_delay),
+        "requested_rotation_settle_delay": float(requested_rotation_settle_delay),
+        "requested_step_settle_delay": float(requested_step_settle_delay),
         "final_center_after_reacquire": bool(final_center_after_reacquire),
         "final_center_max_axis_splits": int(final_center_max_axis_splits),
         "final_center_waypoint_depth": int(final_center_waypoint_depth),
@@ -4031,6 +5235,7 @@ def execute_reflection_count_fixed_plan(
         "final_center_min_improvement": float(final_center_min_improvement),
         "require_target_N_R_estimate_for_reacquire_stop": bool(require_target_N_R_estimate_for_reacquire_stop),
         "min_reacquire_pulse_fraction": float(min_reacquire_pulse_fraction),
+        "target_reacquire_extend_until_reacquired": bool(target_reacquire_extend_until_reacquired),
         "reacquire_angle_scan_limit": float(reacquire_angle_scan_limit),
         "reacquire_scan_samples": int(reacquire_scan_samples),
         "reacquire_max_first_leg_candidates": int(reacquire_max_first_leg_candidates),
@@ -4041,18 +5246,42 @@ def execute_reflection_count_fixed_plan(
         "surface_stage_active_actuators": list(surface_stage_active_actuators),
         "surface_stage_sweep_actuator": surface_stage_sweep_actuator,
         "surface_stage_distance_metric": surface_stage_distance_metric,
+        "surface_stage_match_target_3d": bool(surface_stage_match_target_3d),
         "surface_stage_qc_tolerance": float(surface_stage_qc_tolerance),
         "surface_stage_path_qc_limit": float(surface_stage_path_qc_limit),
+        "surface_stage_qc_step_tolerance": float(surface_stage_qc_step_tolerance),
+        "surface_stage_angle_fit_qc_tolerance": surface_stage_angle_fit_qc_tolerance,
+        "surface_stage_qc_overshoot_allowance": float(surface_stage_qc_overshoot_allowance),
+        "surface_stage_control_mode": "qc_endpoint_feedback" if surface_stage_strategy else None,
+        "surface_stage_qc_safety_limit": float(surface_stage_path_qc_limit + surface_stage_qc_overshoot_allowance),
+        "surface_stage_max_chunks_per_step": int(surface_stage_max_chunks_per_step),
         "surface_stage_sweep_half_span_deg": (
             None if surface_stage_sweep_half_span_deg is None
             else float(surface_stage_sweep_half_span_deg)
         ),
         "surface_stage_sweep_step_deg": float(surface_stage_sweep_step_deg),
         "surface_stage_sweep_refinement_levels": int(surface_stage_sweep_refinement_levels),
+        "surface_stage_sweep_expand_to_bounds": bool(surface_stage_sweep_expand_to_bounds),
+        "surface_stage_sweep_max_half_span_deg": surface_stage_sweep_max_half_span_deg,
+        "surface_stage_sweep_min_step_deg": float(surface_stage_sweep_min_step_deg),
         "surface_stage_preferred_axis": surface_stage_preferred_axis,
         "surface_stage_line_max_steps_per_side": int(surface_stage_line_max_steps_per_side),
         "surface_stage_line_step_deg": float(surface_stage_line_step_deg),
         "surface_stage_projection_refinement_samples": int(surface_stage_projection_refinement_samples),
+        "surface_stage_max_path_candidates": int(surface_stage_max_path_candidates),
+        "surface_stage_repair_source_bounds": bool(surface_stage_repair_source_bounds),
+        "surface_stage_source_repair_n_tries": (
+            None if surface_stage_source_repair_n_tries is None
+            else int(surface_stage_source_repair_n_tries)
+        ),
+        "surface_stage_source_repair_angle_perturb": (
+            None if surface_stage_source_repair_angle_perturb is None
+            else float(surface_stage_source_repair_angle_perturb)
+        ),
+        "surface_stage_stop_after_stage": bool(surface_stage_stop_after_stage),
+        "surface_stage_target_jump_include_active_residuals": bool(
+            surface_stage_target_jump_include_active_residuals
+        ),
         "target_center_after_jump": bool(target_center_after_jump),
         "target_center_u_min": (
             None if target_center_u_min is None else float(target_center_u_min)
@@ -4065,11 +5294,14 @@ def execute_reflection_count_fixed_plan(
 
     log(
         f"done success={final_success} "
-        f"N_R_sim={final_sim_reflections} target={int(target_N_R)} "
+        f"status={completion_status} "
+        f"{'N_R_simulated_physical' if dry_run else 'N_R_model'}={final_sim_reflections} target={int(target_N_R)} "
         f"beam_reacquired={beam_reacquired} "
         f"requires_inverse_refresh={requires_inverse_refresh} "
+        f"reflection_count_verified={bool(dry_run)} warnings={len(execution_warnings)} "
         f"qc_valid={final_qc['valid']} "
-        f"qc_x=({final_qc['x'][0]:.3f},{final_qc['x'][1]:.3f})"
+        f"qc_x=({final_qc['x'][0]:.3f},{final_qc['x'][1]:.3f}) "
+        f"pulses={total_execution_pulses}/{max_total_steps} failure={failure_reason}"
     )
 
     return final_mirrors, final_res, execution
@@ -4226,47 +5458,185 @@ def save_choose_OPD_actuation_gif(actuation_plan, output_path="choose_OPD_actuat
     )
 
 
-def plot_fixed_plan_quadcell_overlay(execution, show_difference=True):
-    """Plot planned quadcell offsets with the fixed-plan measured path overlaid."""
-    actuation_plan = execution["actuation_plan"]
+def save_fixed_plan_execution(execution, output_path=None, *, overwrite=True):
+    """Save an execute_OPD_fixed_plan execution dict for later plotting."""
+    target = execution.get("target_OPD", "unknown") if isinstance(execution, dict) else "unknown"
+    if output_path is None:
+        try:
+            target_text = f"{float(target):.0f}"
+        except Exception:
+            target_text = str(target).replace(" ", "_")
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        output_path = Path("fixed_plan_executions") / f"fixed_OPD_{target_text}_{timestamp}.pkl"
+    else:
+        output_path = Path(output_path)
+        if output_path.suffix == "":
+            output_path = output_path.with_suffix(".pkl")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"{output_path} already exists.")
+
+    payload = {
+        "format": "fixed_plan_execution",
+        "format_version": 1,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "execution": execution,
+    }
+    with output_path.open("wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return str(output_path)
+
+
+def load_fixed_plan_execution(path):
+    """Load an execution dict saved by save_fixed_plan_execution."""
+    with Path(path).open("rb") as f:
+        payload = pickle.load(f)
+    if isinstance(payload, dict) and payload.get("format") == "fixed_plan_execution":
+        return payload["execution"]
+    return payload
+
+
+def _fixed_plan_overlay_records(execution, show_pulses):
+    """Align QC, angle snapshots, and rollbacks on the planned step axis."""
+    log = execution.get("execution_log", [])
+    plan = execution.get("actuation_plan") or {}
+    sign = float(execution.get("qc_readout_sign", -1.0))
+
+    def record(position, kind, raw_qc, valid=True, estimate_x=None, physical_x=None, **extra):
+        qc = _sim_qc_from_quadcell_readout(
+            np.array([np.nan, np.nan] if raw_qc is None else raw_qc, dtype=float), sign,
+        )
+        return {
+            "position": float(position), "kind": kind, "qc": qc, "valid": bool(valid),
+            "estimate_x": estimate_x, "physical_x": physical_x, **extra,
+        }
+
+    if not log:
+        initial_qc = execution.get("initial_qc_x")
+        if initial_qc is None:
+            return []
+        return [record(
+            0, "start", initial_qc, np.all(np.isfinite(initial_qc)),
+            execution.get("initial_estimate_x", plan.get("start_x")),
+            execution.get("initial_physical_x"),
+        )]
+
+    first = log[0]
+    records = [record(
+        0, "start", first.get("before_qc_x", first.get("before_qc_y")),
+        first.get("before_qc_signal_valid", True),
+        first.get("estimate_x_before_step", plan.get("start_x")),
+        first.get("physical_x_before_step"),
+    )]
+    for index, entry in enumerate(log, start=1):
+        step = int(entry.get("execution_step", index))
+        samples = (
+            entry.get("pulses") or entry.get("chunks") or
+            (entry.get("detail") or {}).get("chunks") or []
+        ) if show_pulses else []
+        event_count = len(samples) + sum(bool(sample.get("rolled_back")) for sample in samples)
+        event_index = 0
+        previous_estimate = entry.get("estimate_x_before_step")
+        previous_physical = entry.get("physical_x_before_step")
+        for sample in samples:
+            event_index += 1
+            records.append(record(
+                step - 1 + event_index / (event_count + 1), "pulse",
+                sample.get("qc_x", sample.get("qc_y")), sample.get("qc_signal_valid", True),
+                sample.get("estimate_x_after_pulse"), sample.get("physical_x_after_pulse"),
+                unsafe=bool(sample.get("rolled_back")),
+            ))
+            if sample.get("rolled_back"):
+                event_index += 1
+                records.append(record(
+                    step - 1 + event_index / (event_count + 1), "rollback",
+                    sample.get("rollback_qc_x", sample.get("rollback_qc_y")),
+                    sample.get("rollback_qc_signal_valid", entry.get("after_qc_signal_valid", True)),
+                    previous_estimate, previous_physical,
+                ))
+            else:
+                previous_estimate = sample.get("estimate_x_after_pulse")
+                previous_physical = sample.get("physical_x_after_pulse")
+        endpoint = record(
+            step, "endpoint", entry.get("after_qc_x", entry.get("after_qc_y")),
+            entry.get("after_qc_signal_valid", True),
+            entry.get("estimate_x_after_step"), entry.get("physical_x_after_step"),
+            estimate_path_metrics=entry.get("estimate_path_metrics"),
+            physical_path_metrics=entry.get("physical_path_metrics"),
+        )
+        if entry.get("measured_sim_qc") is not None:
+            endpoint["qc"] = np.array(entry["measured_sim_qc"], dtype=float)
+        records.append(endpoint)
+    return records
+
+
+def _finish_fixed_plan_overlay(fig, ax, execution):
+    import textwrap
+
+    failure = execution.get("failure_reason")
+    log = execution.get("execution_log", [])
+    if failure:
+        failed_entry = next((entry for entry in log if (
+            entry.get("failure_reason") or (entry.get("detail") or {}).get("failure_reason")
+        )), log[-1] if log else None)
+        if failed_entry is not None:
+            ax.axvline(
+                int(failed_entry["execution_step"]), color="crimson", linestyle=":",
+                linewidth=1.2, label="execution stopped",
+            )
+        elif execution.get("fixed_plan_substep_log"):
+            ax.axvline(0, color="crimson", linestyle=":", linewidth=1.2, label="no actuator moves executed")
+    detailed_log = bool(execution.get("reflection_count_change") or execution.get("fixed_plan_substep_log"))
+    if detailed_log:
+        fig.set_size_inches(12, 5, forward=False)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+    else:
+        ax.legend()
+    if detailed_log or failure:
+        target = execution.get("target_N_R")
+        heading = f"N_R={target}: " if target is not None else ""
+        if not heading and execution.get("target_OPD") is not None:
+            heading = f"OPD={float(execution['target_OPD']):g} mm: "
+        status = str(failure) if failure else execution.get("completion_message", "Execution completed")
+        if failure and not log and execution.get("fixed_plan_substep_log"):
+            status = "No actuator moves executed. " + status
+        fig.suptitle(textwrap.fill(heading + status, width=90), fontsize=10)
+        fig.tight_layout()
+    else:
+        fig.tight_layout()
+
+
+def plot_fixed_plan_quadcell_overlay(execution, show_difference=True, *, show_pulses=None, xlim=None):
+    """Overlay planned QC offsets and recorded readings, including failed runs.
+
+    Reflection-count and new OPD logs include pulse/rollback samples by default.
+    Readouts use the simulation sign convention to match the planned curves.
+    The displayed offset range is fixed to +/-1 mm; recorded data is unchanged.
+    xlim=(start_step, end_step) selects an actuator-step window, including
+    fractional steps. None keeps the automatic full-range view.
+    """
+    actuation_plan = execution.get("actuation_plan") or {}
     fig, ax = S.plot_actuation_quadcell_offsets(
         actuation_plan,
         show_difference=show_difference
     )
+    ax.set_ylim(-1.0, 1.0)
+    if xlim is not None:
+        ax.set_xlim(*xlim)
 
-    log = execution.get("execution_log", [])
-    if len(log) == 0:
+    if show_pulses is None:
+        show_pulses = bool(execution.get("reflection_count_change") or execution.get("fixed_plan_substep_log"))
+    records = _fixed_plan_overlay_records(execution, show_pulses)
+    if not records:
+        _finish_fixed_plan_overlay(fig, ax, execution)
         return fig, ax
 
-    qc_readout_sign = float(execution.get("qc_readout_sign", -1.0))
-
-    def sim_qc_from_entry(entry, key):
-        if key == "before":
-            raw = entry.get("before_qc_x", entry.get("before_qc_y"))
-        else:
-            raw = entry.get("after_qc_x", entry.get("after_qc_y"))
-        if raw is None:
-            return None
-        return _sim_qc_from_quadcell_readout(np.array(raw, dtype=float), qc_readout_sign)
-
-    step_numbers = [0]
-    start_sim_qc = sim_qc_from_entry(log[0], "before")
-    if start_sim_qc is None:
-        start_sim_qc = np.array([np.nan, np.nan], dtype=float)
-    qc1_actual = [float(start_sim_qc[0])]
-    qc2_actual = [float(start_sim_qc[1])]
-
-    for entry in log:
-        step_numbers.append(int(entry["execution_step"]))
-        sim_qc = entry.get("measured_sim_qc")
-        if sim_qc is None:
-            sim_qc = sim_qc_from_entry(entry, "after")
-        sim_qc = np.array(
-            [np.nan, np.nan] if sim_qc is None else sim_qc,
-            dtype=float
-        )
-        qc1_actual.append(float(sim_qc[0]))
-        qc2_actual.append(float(sim_qc[1]))
+    step_numbers = np.array([record["position"] for record in records])
+    qc = np.array([record["qc"] for record in records])
+    valid = np.array([record["valid"] for record in records])
+    qc1_actual = np.where(valid, qc[:, 0], np.nan)
+    qc2_actual = np.where(valid, qc[:, 1], np.nan)
 
     ax.plot(
         step_numbers,
@@ -4296,48 +5666,86 @@ def plot_fixed_plan_quadcell_overlay(execution, show_difference=True):
             label="actual QC1 - QC2"
         )
 
+    for mask, label, marker, color in (
+        (np.array([record.get("unsafe", False) for record in records]), "safety-triggering pulse", "x", "crimson"),
+        (np.array([record["kind"] == "rollback" for record in records]), "after rollback", "v", "tab:green"),
+        (~valid, "invalid QC signal", "x", "gray"),
+    ):
+        if np.any(mask):
+            ax.scatter(
+                np.repeat(step_numbers[mask], 2), qc[mask].ravel(),
+                marker=marker, color=color, s=45, zorder=5, label=label,
+            )
+    if execution.get("reflection_count_change"):
+        surface_stage = execution.get("surface_stage_control_mode") == "qc_endpoint_feedback"
+        stage_limit = execution.get("surface_stage_path_qc_limit" if surface_stage else "stage_qc_limit")
+        safety_limit = execution.get("surface_stage_qc_safety_limit") if surface_stage else None
+        for limit, label, color, style in (
+            (stage_limit, "staging planned QC limit", "gray", "--"),
+            (safety_limit, "staging QC safety limit", "crimson", ":"),
+        ):
+            if limit is not None and np.isfinite(float(limit)):
+                ax.axhline(float(limit), color=color, linestyle=style, linewidth=1, label=label)
+                ax.axhline(-float(limit), color=color, linestyle=style, linewidth=1)
+
     ax.set_title("Quadcell Beam Offset During Fixed-Plan Execution")
-    ax.legend()
-    fig.tight_layout()
+    _finish_fixed_plan_overlay(fig, ax, execution)
     return fig, ax
 
 
-def plot_fixed_plan_reflection_u_overlay(execution, prefer_physical=True):
+def plot_fixed_plan_reflection_u_overlay(execution, prefer_physical=True, *, show_pulses=None):
     """Plot planned reflection-u bounds with the executed model path overlaid.
 
     For dry-run executions, prefer_physical=True overlays the randomized physical
     dry-run path. For real hardware, reflection u is not directly measured, so
-    this falls back to the command-estimated model path.
+    this falls back to the estimated model path. Reflection-count and new OPD
+    logs include pulse/rollback positions by default, using recorded states.
     """
-    actuation_plan = execution["actuation_plan"]
+    actuation_plan = execution.get("actuation_plan") or {}
     fig, ax = S.plot_actuation_reflection_u(actuation_plan)
 
-    log = execution.get("execution_log", [])
-    if len(log) == 0:
+    if show_pulses is None:
+        show_pulses = bool(execution.get("reflection_count_change") or execution.get("fixed_plan_substep_log"))
+    records = _fixed_plan_overlay_records(execution, show_pulses)
+    if not show_pulses:
+        records = [record for record in records if record["kind"] == "endpoint"]
+    if not records:
+        _finish_fixed_plan_overlay(fig, ax, execution)
         return fig, ax
 
     use_physical = (
         prefer_physical and
-        any(entry.get("physical_path_metrics") is not None for entry in log)
+        any(record.get("physical_path_metrics") is not None or record.get("physical_x") is not None for record in records)
     )
     metrics_key = "physical_path_metrics" if use_physical else "estimate_path_metrics"
     label_prefix = "actual dry-run" if use_physical else "executed model"
+    state_key = "physical_x" if use_physical else "estimate_x"
+    base_mirrors = actuation_plan.get("start_mirrors")
+    if base_mirrors is None:
+        base_mirrors = execution.get("final_mirrors")
+    if base_mirrors is None:
+        base_mirrors = next((step["mirrors"] for step in actuation_plan.get("steps", []) if step.get("mirrors") is not None), None)
 
     step_numbers = []
     min_us = []
     max_us = []
     margins = []
-    for entry in log:
-        metrics = entry.get(metrics_key)
-        if metrics is None:
-            continue
-        step_numbers.append(int(entry["execution_step"]))
-        min_us.append(float(metrics["min_reflection_u"]))
-        max_us.append(float(metrics["max_reflection_u"]))
-        margins.append(float(metrics["closest_edge_margin"]))
-
-    if len(step_numbers) == 0:
-        return fig, ax
+    for record in records:
+        metrics = record.get(metrics_key)
+        if metrics is None and record.get(state_key) is not None and base_mirrors is not None:
+            edge = S.reflection_edge_summary(
+                record[state_key], *base_mirrors,
+                include_ends=bool(actuation_plan.get("include_edge_ends", False)),
+            )
+            metrics = {
+                "min_reflection_u": edge["min_u"], "max_reflection_u": edge["max_u"],
+                "closest_edge_margin": edge["closest_edge_margin"],
+            }
+        metrics = metrics or {}
+        step_numbers.append(record["position"])
+        min_us.append(float(metrics.get("min_reflection_u", np.nan)))
+        max_us.append(float(metrics.get("max_reflection_u", np.nan)))
+        margins.append(float(metrics.get("closest_edge_margin", np.nan)))
 
     ax.plot(
         step_numbers,
@@ -4365,9 +5773,80 @@ def plot_fixed_plan_reflection_u_overlay(execution, prefer_physical=True):
     )
 
     ax.set_title("Reflection Positions During Fixed-Plan Execution")
-    ax.legend()
-    fig.tight_layout()
+    unsafe = np.array([record.get("unsafe", False) for record in records])
+    if np.any(unsafe):
+        ax.scatter(
+            np.repeat(np.array(step_numbers)[unsafe], 2),
+            np.column_stack([min_us, max_us])[unsafe].ravel(),
+            marker="x", color="crimson", s=45, zorder=5, label="safety-triggering pulse",
+        )
+    rollback = np.array([record["kind"] == "rollback" for record in records])
+    if np.any(rollback):
+        ax.scatter(
+            np.array(step_numbers)[rollback], np.array(min_us)[rollback],
+            marker="v", color="tab:green", s=45, zorder=5, label="after rollback",
+        )
+    _finish_fixed_plan_overlay(fig, ax, execution)
     return fig, ax
+
+
+def plot_reflection_count_execution_diagnostics(execution):
+    """Compare measured QC readouts with pulse-model predictions and signals."""
+    import matplotlib.pyplot as plt
+    import textwrap
+
+    entries = execution.get("execution_log", [])
+    rows = []
+    step_starts = []
+    for entry in entries:
+        step_starts.append((len(rows) + 1, entry.get("execution_step")))
+        for pulse in entry.get("pulses") or entry.get("chunks") or [entry]:
+            rows.append({
+                "qc": pulse.get("qc_x", pulse.get("after_qc_x", [np.nan, np.nan])),
+                "predicted": pulse.get("predicted_qc_x", [np.nan, np.nan]),
+                "signal": pulse.get("qc_signal_strengths", pulse.get("after_qc_signal_strengths", [np.nan, np.nan])),
+                "valid": pulse.get("qc_signal_valid", pulse.get("after_qc_signal_valid", False)),
+            })
+    initial = execution.get("initial_model_comparison", {})
+    rows.insert(0, {
+        "qc": initial.get("measured_qc_x", entries[0].get("before_qc_x", [np.nan, np.nan]) if entries else [np.nan, np.nan]),
+        "predicted": initial.get("predicted_qc_x", [np.nan, np.nan]),
+        "signal": entries[0].get("before_qc_signal_strengths", [np.nan, np.nan]) if entries else [np.nan, np.nan],
+        "valid": initial.get("qc_position_valid", entries[0].get("before_qc_signal_valid", False) if entries else False),
+    })
+    measured = np.asarray([r["qc"] for r in rows], dtype=float)
+    predicted = np.asarray([r["predicted"] for r in rows], dtype=float)
+    signals = np.asarray([r["signal"] for r in rows], dtype=float)
+    valid = np.asarray([r["valid"] for r in rows], dtype=bool)
+    pulse_index = np.arange(len(rows))
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    for index, color in enumerate(("tab:blue", "tab:orange")):
+        label = f"QC{index + 1}"
+        axes[0].plot(pulse_index, measured[:, index], color=color, label=f"{label} measured")
+        axes[0].plot(pulse_index, predicted[:, index], color=color, linestyle="--", label=f"{label} predicted")
+        axes[0].scatter(pulse_index[~valid], measured[~valid, index], color=color, marker="x", zorder=3)
+        residual = measured[:, index] - predicted[:, index]
+        axes[1].plot(pulse_index, np.where(valid, residual, np.nan), color=color, label=label)
+        axes[2].plot(pulse_index, signals[:, index], color=color, label=label)
+        threshold = execution.get("final_qc_signal_thresholds", [execution.get("qc_min_signal", 0.04)] * 2)[index]
+        axes[2].axhline(threshold, color=color, linestyle=":")
+    axes[0].set_title("QC readout vs model prediction; crosses mark invalid/clipped readings")
+    axes[0].set_ylabel("QC readout (converted mm)")
+    axes[1].set_ylabel("Measured - predicted\n(converted mm)")
+    axes[1].axhline(0, color="gray", linewidth=0.7)
+    axes[2].set_ylabel("Signal sum")
+    axes[2].set_xlabel("Executed pulse (0 = after calibration, before staging)")
+    for ax in axes:
+        for pulse, step in step_starts:
+            ax.axvline(pulse, color="gray", linewidth=0.5, alpha=0.4)
+        ax.grid(True, linewidth=0.3)
+        ax.legend(loc="best")
+    for pulse, step in step_starts:
+        axes[0].text(pulse, 1.01, str(step), transform=axes[0].get_xaxis_transform(), fontsize=8)
+    status = execution.get("failure_reason") or execution.get("completion_message", "Execution completed")
+    fig.suptitle(textwrap.fill(str(status), width=100), fontsize=11)
+    fig.tight_layout()
+    return fig, axes
 
 
 def plot_reflection_count_execution_summary(execution):
@@ -4933,7 +6412,9 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                                              tubes=None,
                                              tube_labels=None,
                                              tube_opacity=0.18,
-                                             tube_color="rgba(35, 170, 255, 0.55)"):
+                                             tube_color="rgba(35, 170, 255, 0.55)",
+                                             color_by="sweep", cmap="viridis",
+                                             marker_symbol=None):
     """Interactive 3D overlay of multiple centered-QC slice surfaces."""
     return S.plot_centered_quadcell_angle_surfaces_3d(
         surfaces,
@@ -4959,16 +6440,39 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
         tube_labels=tube_labels,
         tube_opacity=tube_opacity,
         tube_color=tube_color,
+        color_by=color_by,
+        cmap=cmap,
+        marker_symbol=marker_symbol,
     )
 
 
 def plot_reflection_count_surface_family_3d(family, **kwargs):
-    """Interactive 3D plot of a reflection-count surface family."""
+    """Plot a surface family with color_by="N_R" or "sweep" and a chosen cmap."""
     return S.plot_reflection_count_surface_family_3d(family, **kwargs)
 
 
+def extract_reflection_count_surface_boundary(surface_or_family, **kwargs):
+    """Return ordered exact states along an outer edge of one traced surface."""
+    return S.extract_reflection_count_surface_boundary(surface_or_family, **kwargs)
+
+
+def render_reflection_count_surface_boundary_frame_3d(boundary, **kwargs):
+    """Render one angle-surface boundary frame with a red point marker."""
+    return S.render_reflection_count_surface_boundary_frame_3d(boundary, **kwargs)
+
+
+def render_reflection_count_surface_boundary_simulation_frame(boundary, **kwargs):
+    """Render the optical simulation for one exact surface-boundary state."""
+    return S.render_reflection_count_surface_boundary_simulation_frame(boundary, **kwargs)
+
+
+def save_reflection_count_surface_boundary_gifs(surface_or_family, **kwargs):
+    """Save synchronized angle-surface and optical-simulation boundary GIFs."""
+    return S.save_reflection_count_surface_boundary_gifs(surface_or_family, **kwargs)
+
+
 def plot_reflection_count_surface_stage_plan_3d(plan, **kwargs):
-    """Interactive 3D plot of a same-N_R surface staging plan."""
+    """Plot a staging plan, or an execution dict including its estimated path."""
     return S.plot_reflection_count_surface_stage_plan_3d(plan, **kwargs)
 
 

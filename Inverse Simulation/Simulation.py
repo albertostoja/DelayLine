@@ -6,6 +6,7 @@ import json
 import itertools
 import math
 import time
+from matplotlib.patches import Rectangle
 from pathlib import Path
 from types import SimpleNamespace
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from scipy.optimize import least_squares
 from scipy.optimize import differential_evolution
 from scipy.optimize import minimize
 from scipy.optimize import linear_sum_assignment
+from scipy.spatial import ConvexHull, QhullError
 with open("roi_config.json", "r") as f:
     rois = json.load(f)
 
@@ -32,12 +34,13 @@ D = np.array(camera_calib_data["D"])
 mirror_lengths = [21.4, 21.4, 21.4, 21.4]
 
 # Set up the laser
-laser_start = (0, 100)
+laser_start = (-700, 100)
 laser_angle = 0  # Initial laser angle in degrees
 
 #Quad Cell Locations
 qc_1 = np.array([-191, 159.46]) # Optimized for.    Initial calib was: ([-191, 158.24])
-qc_2 = np.array([-300, 187.52]) # Optimized for.    Initial calib was: ([-300, 185.75])    
+qc_2 = np.array([-300, 187.52]) # Optimized for.    Initial calib was: ([-300, 185.75])
+qc_3 = np.array([-595, 263.46])
 
 # Calculating OPD
 OPD_x_start = 102.1 # This is the x-coordinate of where the mirror would be in the delay line arm of the M-Z if there was no delay line
@@ -66,6 +69,7 @@ SIGMA_REFL = 3          # px (tune)
 SIGMA_OPD = 0.01
 SIGMA_QC = 0.01
 SIGMA_MIRROR_CENTER = 0.15
+DEFAULT_CENTER_RETRY_ANGLE_SCALES = (1.0, 0.25, 0.0625)
 
 DEFAULT_PEN = 50.0     # px penalty converted to residual via /SIGMA_REFL
 
@@ -355,24 +359,24 @@ def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4
     #plt.scatter(*laser_start, color='red', label="Laser Source", linewidth=1)
 
     # Piezo mount outline visualizer
-    doubled_lines, orthogonal_lines = process_mirrors(mirrors)
+    #doubled_lines, orthogonal_lines = process_mirrors(mirrors)
 
     # Draw mirrors
     for mirror in mirrors:
         plt.plot([mirror[0][0], mirror[1][0]],
                  [mirror[0][1], mirror[1][1]],
-                 color='black', linewidth=3)
+                 color='black', linewidth=6)
 
     #Draw mirror mount outlines
-    for mirror in doubled_lines:
-        plt.plot([mirror[0][0], mirror[1][0]],
-                 [mirror[0][1], mirror[1][1]],
-                 linewidth=1, color='black')
+    #for mirror in doubled_lines:
+    #    plt.plot([mirror[0][0], mirror[1][0]],
+    #             [mirror[0][1], mirror[1][1]],
+    #             linewidth=1, color='black')
 
-    for mirror in orthogonal_lines:
-        plt.plot([mirror[0][0], mirror[1][0]],
-                 [mirror[0][1], mirror[1][1]],
-                 linewidth=1, color='black')
+    #for mirror in orthogonal_lines:
+    #    plt.plot([mirror[0][0], mirror[1][0]],
+    #             [mirror[0][1], mirror[1][1]],
+    #             linewidth=1, color='black')
 
     # --- Laser simulation ---
     max_reflections = 36
@@ -405,14 +409,14 @@ def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4
                  current_position[0] + np.cos(np.radians(current_angle)) * 1000],
                 [current_position[1],
                  current_position[1] + np.sin(np.radians(current_angle)) * 1000],
-                'g--')
+                'g--', linewidth=3)
             break
 
         # Valid reflection
         plt.plot(
             [current_position[0], intersection[0]],
             [current_position[1], intersection[1]],
-            'r-', linewidth=1)
+            'r-', linewidth=3)
 
         # Update ray state
         current_position = intersection
@@ -461,20 +465,24 @@ def simulation(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4
     print("Total Number of Reflection (N_R) =", reflection_count)
 
     # Plot settings
-    plt.xlim(-310, 250)
-    plt.ylim(-10, 210)
+    plt.xlim(0, 200) # -310, 250         -620, 200
+    plt.ylim(50, 150) # -10, 210            50, 280
     #plt.xlim(0, 180)
     #plt.ylim(50, 140)
     #plt.axhline(0, color='black', linewidth=1)
     #plt.axvline(0, color='black', linewidth=1)
     plt.gca().set_aspect('equal', adjustable='box')
     #plt.title("Laser Reflection with Multiple Mirrors")
-    plt.xlabel("X (mm)")
-    plt.ylabel("Y (mm)")
+    plt.xlabel("X (mm)", fontsize=24)
+    plt.ylabel("Y (mm)", fontsize=24)
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
     plt.grid(True, linewidth=0.3)
-    plt.plot([qc_1[0], qc_1[0]], [qc_1[1] - 2, qc_1[1] + 2], linewidth=4, label='QC1')
-    plt.plot([qc_2[0], qc_2[0]], [qc_2[1] - 2, qc_2[1] + 2], linewidth=4, label='QC2')
-    plt.legend(prop={'size': 8})
+    plt.plot([qc_1[0], qc_1[0]], [qc_1[1] - 3.9, qc_1[1] + 3.9], linewidth=8, label='QC1')
+    #plt.plot([qc_2[0], qc_2[0]], [qc_2[1] - 2, qc_2[1] + 2], linewidth=4, label='QC2')
+    plt.plot([qc_3[0], qc_3[0]], [qc_3[1] - 3.9, qc_3[1] + 3.9], linewidth=8, label='QC2')
+    plt.gca().add_patch(Rectangle((0, 50), 200, 100, facecolor=(0, 0, 0, 0), edgecolor='black', linewidth=2))
+    #plt.legend(prop={'size': 8})
     plt.show()
 
 def simulation_fig(m1cx, m1cy, m2cx, m2cy, m3cx, m3cy, m4cx, m4cy, m1a, m2a, m3a, m4a):
@@ -1067,8 +1075,7 @@ def find_clusters_with_circles(patch, threshold=THRESHOLD, eps=EPS, min_samples=
 
 
 def clusters_in_roi(gray, roi, threshold=THRESHOLD, eps=EPS, min_samples=35, show=True):
-    x1, y1, x2, y2 = roi
-    patch = gray[y1:y2, x1:x2]
+    patch, x1, y1 = _masked_roi_patch(gray, roi)
 
     clusters = find_clusters_with_circles(
         patch, threshold=threshold, eps=eps, min_samples=min_samples,
@@ -1081,6 +1088,40 @@ def clusters_in_roi(gray, roi, threshold=THRESHOLD, eps=EPS, min_samples=35, sho
         c["center_full"] = [cx + x1, cy + y1]
 
     return clusters
+
+def _roi_points(roi):
+    arr = np.asarray(roi, dtype=float)
+    if arr.shape == (4,):
+        x0, y0, x1, y1 = arr
+        return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=float)
+    if arr.shape == (4, 2):
+        return arr
+    raise ValueError("ROI must be [x0, y0, x1, y1] or four [x, y] points")
+
+def _masked_roi_patch(gray, roi):
+    points = _roi_points(roi)
+    min_xy = np.floor(points.min(axis=0)).astype(int)
+    max_xy = np.ceil(points.max(axis=0)).astype(int) + 1
+
+    height, width = gray.shape[:2]
+    x0, y0 = np.maximum(min_xy, [0, 0])
+    x1, y1 = np.minimum(max_xy, [width, height])
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(f"ROI is outside the image bounds: {roi}")
+
+    patch = gray[y0:y1, x0:x1].copy()
+    local_points = np.round(points - [x0, y0]).astype(np.int32)
+    mask = np.zeros(patch.shape[:2], dtype=np.uint8)
+    cv.fillPoly(mask, [local_points], 255)
+    if patch.ndim == 2:
+        patch = cv.bitwise_and(patch, patch, mask=mask)
+    else:
+        patch[mask == 0] = 0
+    return patch, x0, y0
+
+def _point_in_roi(x, y, roi):
+    points = _roi_points(roi).astype(np.float32)
+    return cv.pointPolygonTest(points, (float(x), float(y)), False) >= 0
 
 def _threshold_for_roi(name, threshold):
     if isinstance(threshold, dict):
@@ -1117,8 +1158,8 @@ def reflec_pts_cam(gray_img, eps=EPS, min_samples=35, show=False):
     for clusters in all_clusters.values():
         for c in clusters:
             x, y = c["center_full"]
-            for name, (x0, y0, x1, y1) in rois.items():
-                if x0 <= x <= x1 and y0 <= y <= y1:
+            for name, roi in rois.items():
+                if _point_in_roi(x, y, roi):
                     grouped[name].append([float(x), float(y)])
                     break
 
@@ -1169,8 +1210,8 @@ def reflec_pts_cam_num_reflec(gray_img, eps=EPS, min_samples=35, show=False):
     for clusters in all_clusters.values():
         for c in clusters:
             x, y = c["center_full"]
-            for name, (x0, y0, x1, y1) in rois.items():
-                if x0 <= x <= x1 and y0 <= y <= y1:
+            for name, roi in rois.items():
+                if _point_in_roi(x, y, roi):
                     grouped[name].append([float(x), float(y)])
                     break
 
@@ -2035,9 +2076,9 @@ def plot_actuation_quadcell_offsets(actuation_plan, show_difference=True):
 def plot_actuation_reflection_u(actuation_plan):
     steps = actuation_plan.get("steps", [])
     step_numbers = [0] + [step["step"] for step in steps]
-    min_us = [np.nan] + [step["min_reflection_u"] for step in steps]
-    max_us = [np.nan] + [step["max_reflection_u"] for step in steps]
-    margins = [np.nan] + [step["closest_edge_margin"] for step in steps]
+    min_us = [np.nan] + [step.get("min_reflection_u", np.nan) for step in steps]
+    max_us = [np.nan] + [step.get("max_reflection_u", np.nan) for step in steps]
+    margins = [np.nan] + [step.get("closest_edge_margin", np.nan) for step in steps]
 
     u_min = actuation_plan.get("u_min", 0.1)
     u_max = actuation_plan.get("u_max", 0.9)
@@ -2135,12 +2176,61 @@ def _actuation_record_mirror_names(record, zero_tol=1e-12):
 
     return active
 
+
+def _actuation_record_motion_kind(record, zero_tol=1e-12):
+    """Return 'linear' for dx moves, 'rotation' for dangle moves, or None."""
+    actuator = record.get("actuator")
+    if isinstance(actuator, str):
+        if actuator.endswith(".dx"):
+            return "linear"
+        if actuator.endswith(".dangle"):
+            return "rotation"
+
+    axis_index = record.get("axis_index")
+    if axis_index is not None:
+        try:
+            axis_index = int(axis_index)
+        except (TypeError, ValueError):
+            axis_index = None
+        if axis_index is not None:
+            for _, command_name, idx in ACTUATOR_AXES:
+                if idx == axis_index:
+                    return "linear" if command_name == "dx" else "rotation"
+
+    if isinstance(record.get("linear_stage"), str):
+        return "linear"
+
+    commands = record.get("commands")
+    if isinstance(commands, dict):
+        found_rotation = False
+        for mirror_commands in commands.values():
+            if not isinstance(mirror_commands, dict):
+                continue
+            for command_name, value in mirror_commands.items():
+                try:
+                    moving = abs(float(value)) > zero_tol
+                except (TypeError, ValueError):
+                    moving = False
+                if not moving:
+                    continue
+                if command_name == "dx":
+                    return "linear"
+                if command_name == "dangle":
+                    found_rotation = True
+        if found_rotation:
+            return "rotation"
+
+    return None
+
+
 def render_actuation_plan_frame(actuation_plan, frame_index=0, include_start=True,
                                 figsize=(10, 5), dpi=120,
                                 xlim=(-320, 230), ylim=(-15, 215),
                                 qc_window=None, draw_mount_outline=True,
                                 highlight_actuated_mirror=True,
                                 highlight_color="tab:green",
+                                highlight_linear_color="gold",
+                                highlight_rotation_color=None,
                                 highlight_linewidth=7.0):
     """Render one choose_OPD actuation-plan waypoint as a matplotlib figure."""
     records = _actuation_plan_frame_records(actuation_plan, include_start=include_start)
@@ -2167,6 +2257,18 @@ def render_actuation_plan_frame(actuation_plan, frame_index=0, include_start=Tru
         if highlight_actuated_mirror
         else set()
     )
+    motion_kind = _actuation_record_motion_kind(record)
+    if motion_kind == "linear":
+        active_highlight_color = highlight_linear_color
+        active_highlight_label = "linear move"
+    elif motion_kind == "rotation":
+        active_highlight_color = (
+            highlight_color if highlight_rotation_color is None else highlight_rotation_color
+        )
+        active_highlight_label = "rotation move"
+    else:
+        active_highlight_color = highlight_color
+        active_highlight_label = "actuated mirror"
 
     if draw_mount_outline:
         doubled_lines, orthogonal_lines = process_mirrors(mirrors)
@@ -2187,12 +2289,12 @@ def render_actuation_plan_frame(actuation_plan, frame_index=0, include_start=Tru
             ax.plot(
                 [mirror[0][0], mirror[1][0]],
                 [mirror[0][1], mirror[1][1]],
-                color=highlight_color,
+                color=active_highlight_color,
                 linewidth=highlight_linewidth,
                 alpha=0.45,
                 solid_capstyle="round",
                 zorder=5,
-                label="actuated mirror" if not active_label_added else None
+                label=active_highlight_label if not active_label_added else None
             )
             active_label_added = True
         ax.plot(
@@ -2208,7 +2310,7 @@ def render_actuation_plan_frame(actuation_plan, frame_index=0, include_start=Tru
         if is_active_mirror:
             label_kwargs["bbox"] = {
                 "boxstyle": "round,pad=0.2",
-                "facecolor": highlight_color,
+                "facecolor": active_highlight_color,
                 "edgecolor": "none",
                 "alpha": 0.22
             }
@@ -2289,6 +2391,8 @@ def save_actuation_plan_simulation_gif(actuation_plan, output_path="choose_OPD_a
                                        qc_window=None, draw_mount_outline=True,
                                        highlight_actuated_mirror=True,
                                        highlight_color="tab:green",
+                                       highlight_linear_color="gold",
+                                       highlight_rotation_color=None,
                                        highlight_linewidth=7.0):
     """Save a GIF showing the simulated geometry at each actuation-plan waypoint."""
     if fps <= 0:
@@ -2317,6 +2421,8 @@ def save_actuation_plan_simulation_gif(actuation_plan, output_path="choose_OPD_a
             draw_mount_outline=draw_mount_outline,
             highlight_actuated_mirror=highlight_actuated_mirror,
             highlight_color=highlight_color,
+            highlight_linear_color=highlight_linear_color,
+            highlight_rotation_color=highlight_rotation_color,
             highlight_linewidth=highlight_linewidth
         )
         frames.append(Image.fromarray(_figure_to_rgb_array(fig)))
@@ -2466,11 +2572,14 @@ def try_greedy_one_actuator_path(x_start, x_target, M1, M2, M3, M4,
                                  enforce_edge_bounds=True,
                                  include_edge_ends=False,
                                  constraint_tolerance=0.0,
-                                 zero_tol=1e-9):
+                                 zero_tol=1e-9,
+                                 profile_callback=None):
     x_current = np.array(x_start, dtype=float).copy()
     x_target = np.array(x_target, dtype=float)
     steps = []
     variable_scale = np.array([10.0, 0.1, 10.0, 0.1, 10.0, 0.1, 10.0, 0.1], dtype=float)
+    search_t0 = time.perf_counter()
+    last_progress_t = search_t0
 
     for _ in range(max_steps):
         remaining = x_target - x_current
@@ -2496,6 +2605,16 @@ def try_greedy_one_actuator_path(x_start, x_target, M1, M2, M3, M4,
                 scan_samples=max(motion_samples_per_step * 2, 20),
                 zero_tol=zero_tol
             )
+            if profile_callback is not None:
+                now = time.perf_counter()
+                if now - last_progress_t >= 5.0:
+                    profile_callback(
+                        f"path search greedy in_progress elapsed={now - search_t0:.1f}s "
+                        f"steps={len(steps)}/{max_steps} checking={actuator_label(int(axis_index))} "
+                        f"remaining_scaled_distance={current_distance:.6g} "
+                        f"remaining_angle_norm_deg={np.linalg.norm(remaining[[1, 3, 5, 7]]):.6g}"
+                    )
+                    last_progress_t = now
             if max_fraction <= 1e-6:
                 continue
 
@@ -2570,10 +2689,13 @@ def validate_actuation_steps(steps, x_start, M1, M2, M3, M4,
                              u_max=0.9,
                              enforce_edge_bounds=True,
                              include_edge_ends=False,
-                             constraint_tolerance=0.0):
+                             constraint_tolerance=0.0,
+                             profile_callback=None):
     x_previous = np.array(x_start, dtype=float).copy()
+    validation_t0 = time.perf_counter()
+    last_progress_t = validation_t0
 
-    for step in steps:
+    for step_number, step in enumerate(steps, start=1):
         x_current = pack_variables(*step["mirrors"])
         if not one_actuator_motion_is_valid(
             x_previous, x_current, M1, M2, M3, M4,
@@ -2589,6 +2711,14 @@ def validate_actuation_steps(steps, x_start, M1, M2, M3, M4,
         ):
             return False, f"step {step['step']} failed dense validation"
         x_previous = x_current
+        if profile_callback is not None:
+            now = time.perf_counter()
+            if now - last_progress_t >= 5.0:
+                profile_callback(
+                    f"dense validation in_progress steps={step_number}/{len(steps)} "
+                    f"elapsed={now - validation_t0:.1f}s"
+                )
+                last_progress_t = now
 
     return True, None
 
@@ -2703,6 +2833,7 @@ def plan_actuation_path(x_start, x_target, M1, M2, M3, M4,
     fast_axis_orders = candidate_axis_orders(active_axes, delta, include_all_permutations=False)
 
     phase_t0 = time.perf_counter()
+    profile_path(f"path search full_orders start orders={len(full_axis_orders)} samples={motion_samples_per_step}")
     for axis_order in full_axis_orders:
         steps = try_one_actuator_sequence(
             x_start, x_target, axis_order, M1, M2, M3, M4,
@@ -2740,6 +2871,7 @@ def plan_actuation_path(x_start, x_target, M1, M2, M3, M4,
     )
 
     phase_t0 = time.perf_counter()
+    profile_path(f"path search greedy start max_steps={max_axis_splits * max(len(active_axes), 1)}")
     greedy_steps = try_greedy_one_actuator_path(
         x_start, x_target, M1, M2, M3, M4,
         max_steps=max_axis_splits * max(len(active_axes), 1),
@@ -2752,7 +2884,8 @@ def plan_actuation_path(x_start, x_target, M1, M2, M3, M4,
         enforce_edge_bounds=enforce_edge_bounds,
         include_edge_ends=include_edge_ends,
         constraint_tolerance=constraint_tolerance,
-        zero_tol=zero_tol
+        zero_tol=zero_tol,
+        profile_callback=profile_callback
     )
     if greedy_steps is not None:
         profile_path(
@@ -2777,6 +2910,8 @@ def plan_actuation_path(x_start, x_target, M1, M2, M3, M4,
     )
 
     phase_t0 = time.perf_counter()
+    last_progress_t = phase_t0
+    profile_path(f"path search split start max_axis_splits={max_axis_splits}")
     for split_count in range(2, max_axis_splits + 1):
         x_current = x_start.copy()
         steps = []
@@ -2792,6 +2927,14 @@ def plan_actuation_path(x_start, x_target, M1, M2, M3, M4,
             best_max_qc = np.inf
 
             for axis_order in fast_axis_orders:
+                if profile_callback is not None:
+                    now = time.perf_counter()
+                    if now - last_progress_t >= 5.0:
+                        profile_path(
+                            f"path search split in_progress split_count={split_count}/{max_axis_splits} "
+                            f"segment={split_index + 1}/{split_count} elapsed={now - phase_t0:.1f}s"
+                        )
+                        last_progress_t = now
                 x_trial = x_current.copy()
                 trial_steps = []
                 order_failed = False
@@ -3399,7 +3542,8 @@ def append_constrained_path_steps(steps, x_start, x_target, M1, M2, M3, M4,
         u_max=u_max,
         enforce_edge_bounds=enforce_edge_bounds,
         include_edge_ends=include_edge_ends,
-        constraint_tolerance=constraint_tolerance
+        constraint_tolerance=constraint_tolerance,
+        profile_callback=profile_callback
     )
 
     if path_plan["failure_reason"] is not None:
@@ -3480,6 +3624,7 @@ def append_constrained_path_steps_fast_then_dense(
             expected_reflections = get_reflection_count(*unpack_variables(x_start, M1, M2, M3, M4))
 
         phase_t0 = time.perf_counter()
+        profile_path(f"fast path dense validation start samples={dense_samples} steps={len(trial_steps)}")
         valid, validation_reason = validate_actuation_steps(
             trial_steps, x_start, M1, M2, M3, M4,
             max_qc_error=max_qc_error,
@@ -3490,7 +3635,8 @@ def append_constrained_path_steps_fast_then_dense(
             u_max=u_max,
             enforce_edge_bounds=enforce_edge_bounds,
             include_edge_ends=include_edge_ends,
-            constraint_tolerance=constraint_tolerance
+            constraint_tolerance=constraint_tolerance,
+            profile_callback=profile_callback
         )
         profile_path(
             f"fast path dense validation dt={time.perf_counter() - phase_t0:.3f}s "
@@ -5003,14 +5149,28 @@ def optimize_inverse(M1, M2, M3, M4, img_path_light, img_path_dark=None,
     return res
 
 def solve_center_once(theta0, M1, M2, M3, M4, target_reflections,
-                      u_min=0.1, u_max=0.9, sigma_edge=0.1):
-    res = least_squares(
-        fun=lambda th: center_quadcells_residuals(
+                      u_min=0.1, u_max=0.9, sigma_edge=0.1, profile_callback=None):
+    solve_t0 = time.perf_counter()
+    last_progress_t = solve_t0
+    evaluations = 0
+
+    def residuals(th):
+        nonlocal last_progress_t, evaluations
+        evaluations += 1
+        if profile_callback is not None:
+            now = time.perf_counter()
+            if now - last_progress_t >= 5.0:
+                profile_callback(f"center solve in_progress residual_evaluations={evaluations} elapsed={now - solve_t0:.1f}s")
+                last_progress_t = now
+        return center_quadcells_residuals(
             th, M1, M2, M3, M4,
             target_reflections=target_reflections,
             u_min=u_min, u_max=u_max,
             sigma_edge=sigma_edge
-        ),
+        )
+
+    res = least_squares(
+        fun=residuals,
         x0=np.array(theta0, dtype=float),
         loss="linear",
         f_scale=1.0,
@@ -5036,7 +5196,8 @@ def center_quadcells(M1, M2, M3, M4,
                      enforce_final_u_bounds=True,
                      final_u_tolerance=1e-9,
                      final_u_min=None,
-                     final_u_max=None):
+                     final_u_max=None,
+                     profile_callback=None):
     """Find a rotation-only solution with the requested reflection count.
 
     When final_qc_tolerance is set, endpoints must have both quadcell offsets
@@ -5090,8 +5251,22 @@ def center_quadcells(M1, M2, M3, M4,
     valid_solution_count = 0
     edge_valid_solution_count = 0
     centered_solution_count = 0
+    search_t0 = time.perf_counter()
+    last_progress_t = search_t0
+    if profile_callback is not None:
+        profile_callback(f"center search start target_N_R={target_reflections} starts={len(starts)} angle_perturb={angle_perturb:g}deg")
 
-    for th0 in starts:
+    for start_index, th0 in enumerate(starts, start=1):
+        if profile_callback is not None:
+            now = time.perf_counter()
+            if now - last_progress_t >= 5.0:
+                profile_callback(
+                    f"center search in_progress starts_checked={start_index - 1}/{len(starts)} "
+                    f"matching_N_R={matching_start_count} centered_solutions={centered_solution_count} "
+                    f"best_total_angle_change_deg={getattr(best_res, 'final_angle_change_total_abs', None)} "
+                    f"elapsed={now - search_t0:.1f}s"
+                )
+                last_progress_t = now
         M1_start = np.array([M1[0], M1[1], th0[0]], dtype=float)
         M2_start = np.array([M2[0], M2[1], th0[1]], dtype=float)
         M3_start = np.array([M3[0], M3[1], th0[2]], dtype=float)
@@ -5107,7 +5282,11 @@ def center_quadcells(M1, M2, M3, M4,
             th0, M1, M2, M3, M4,
             target_reflections=target_reflections,
             u_min=u_min, u_max=u_max,
-            sigma_edge=sigma_edge
+            sigma_edge=sigma_edge,
+            profile_callback=(
+                (lambda message: profile_callback(f"start={start_index}/{len(starts)} " + message))
+                if profile_callback is not None else None
+            )
         )
 
         M1_new = np.array([M1[0], M1[1], res.x[0]], dtype=float)
@@ -5178,6 +5357,13 @@ def center_quadcells(M1, M2, M3, M4,
             best_res.final_closest_edge_margin = final_closest_edge_margin
             best_res.final_u_ok = bool(final_u_ok)
 
+    if profile_callback is not None:
+        profile_callback(
+            f"center search done starts_checked={len(starts)} matching_N_R={matching_start_count} "
+            f"centered_solutions={centered_solution_count} "
+            f"best_total_angle_change_deg={getattr(best_res, 'final_angle_change_total_abs', None)} "
+            f"elapsed={time.perf_counter() - search_t0:.3f}s"
+        )
     if best_res is None:
         if matching_start_count == 0:
             raise RuntimeError(
@@ -5219,6 +5405,48 @@ def center_quadcells(M1, M2, M3, M4,
     M4_opt = np.array([M4[0], M4[1], best_angles[3]], dtype=float)
 
     return (M1_opt, M2_opt, M3_opt, M4_opt), best_res
+
+
+def _normalize_center_retry_angle_scales(scales):
+    scales = tuple(float(scale) for scale in scales)
+    if not scales or any(not np.isfinite(scale) or scale <= 0 for scale in scales):
+        raise ValueError("center_retry_angle_scales must contain positive finite values.")
+    return scales
+
+
+def _center_quadcells_with_retries(
+        M1, M2, M3, M4, *, angle_perturb=0.2,
+        center_retry_angle_scales=DEFAULT_CENTER_RETRY_ANGLE_SCALES,
+        profile_callback=None, **center_kwargs):
+    """Share the family/planner seed search without changing its constraints."""
+    scales = _normalize_center_retry_angle_scales(center_retry_angle_scales)
+    attempts = []
+    for attempt_index, scale in enumerate(scales):
+        span = float(angle_perturb) * scale
+        attempt_t0 = time.perf_counter()
+        attempt = {"angle_perturb": span, "success": False}
+        attempts.append(attempt)
+        if attempt_index and profile_callback is not None:
+            profile_callback(f"center search retry angle_perturb={span:g}deg")
+        try:
+            mirrors, result = center_quadcells(
+                M1, M2, M3, M4, angle_perturb=span,
+                profile_callback=profile_callback, **center_kwargs,
+            )
+        except RuntimeError as exc:
+            attempt["elapsed_s"] = time.perf_counter() - attempt_t0
+            attempt["failure_reason"] = str(exc)
+            if profile_callback is not None:
+                profile_callback(f"center search span={span:g}deg failed: {exc}")
+            if attempt_index == len(scales) - 1:
+                exc.center_search_attempts = attempts
+                raise
+            continue
+        attempt["success"] = True
+        attempt["elapsed_s"] = time.perf_counter() - attempt_t0
+        result.center_search_attempts = attempts
+        result.center_angle_perturb_used = span
+        return mirrors, result
 
 
 def _active_angle_axes(active_actuators=None):
@@ -5665,12 +5893,18 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
                                         sigma_edge=0.02,
                                         correction_regularization=0.08,
                                         max_corrector_nfev=120,
-                                        include_edge_ends=False):
+                                        include_edge_ends=False,
+                                        profile_callback=None,
+                                        min_progress_deg=None):
     """Trace a 1D centered-QC curve in the selected mirror-angle space.
 
     QC centering gives two equations. With three active angle variables, the
     centered set is generally a true 1D curve. With four active variables, this
     traces one useful 1D curve on the larger centered surface.
+
+    Stop after retaining the last valid point when forward motion falls below
+    min_progress_deg (by default 1% of step_deg, at least 1e-6 degrees).
+    Set min_progress_deg=0 to retain the legacy endpoint sampling density.
     """
     M_start = (
         np.array(M1, dtype=float),
@@ -5696,6 +5930,12 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
     target_reflections = int(target_reflections)
     n_steps = max(0, int(n_steps))
     step_deg = float(abs(step_deg))
+    min_progress_deg = (
+        max(1e-6, 0.01 * step_deg)
+        if min_progress_deg is None else float(min_progress_deg)
+    )
+    if not np.isfinite(min_progress_deg) or min_progress_deg < 0:
+        raise ValueError("min_progress_deg must be finite and non-negative.")
     qc_tolerance = float(abs(qc_tolerance))
     u_tolerance = float(abs(u_tolerance))
     accept_u_min = float(u_min) if accept_u_min is None else float(accept_u_min)
@@ -5726,18 +5966,12 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
         x[angle_axes] = np.array(theta, dtype=float)
         return x
 
-    def state_payload(theta, coordinate):
+    def state_payload(theta, coordinate, include_jacobian=True):
         x = x_from_angles(theta)
         mirrors = unpack_variables(x, *M_start)
         qc = np.array(quadcell_errors_from_variables(x, *M_start), dtype=float)
         edge_summary = reflection_edge_summary(x, *M_start, include_ends=include_edge_ends)
-        jac_info = quadcell_angle_jacobian(
-            *M_start,
-            angles=theta,
-            step_deg=jacobian_step_deg,
-            active_actuators=angle_labels,
-        )
-        return {
+        payload = {
             "coordinate": float(coordinate),
             "angles": np.array(theta, dtype=float),
             "x": x,
@@ -5749,8 +5983,13 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
             "max_u": float(edge_summary["max_u"]),
             "closest_edge_margin": float(edge_summary["closest_edge_margin"]),
             "reflection_u_values": np.array(edge_summary["u_values"], dtype=float),
-            "jacobian": jac_info["jacobian"],
         }
+        if include_jacobian:
+            payload["jacobian"] = quadcell_angle_jacobian(
+                *M_start, angles=theta, step_deg=jacobian_step_deg,
+                active_actuators=angle_labels,
+            )["jacobian"]
+        return payload
 
     def validate_payload(payload):
         if payload["reflection_count"] != target_reflections:
@@ -5763,60 +6002,69 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
             return False, f"max u {payload['max_u']:.4g} > {accept_u_max}"
         return True, None
 
-    def fixed_length_edge_penalties(theta):
-        x = x_from_angles(theta)
-        mirrors = unpack_variables(x, *M_start)
-        if get_reflection_count(*mirrors) != target_reflections:
-            return np.full(expected_u_count, 100.0, dtype=float)
-        penalties = reflection_edge_penalties_from_variables(
-            x,
-            *M_start,
-            u_min=float(u_min) - u_tolerance,
-            u_max=float(u_max) + u_tolerance,
-            include_ends=include_edge_ends,
-        )
-        if len(penalties) != expected_u_count:
-            return np.full(expected_u_count, 100.0, dtype=float)
-        return np.array(penalties, dtype=float)
-
     def correction_residual(theta, theta_pred):
         x = x_from_angles(theta)
         mirrors = unpack_variables(x, *M_start)
+        reflection_data = trace_reflections(laser_start, laser_angle, build_mirrors(*mirrors))
         qc = np.array(quadcell_errors_from_variables(x, *M_start), dtype=float)
-        if get_reflection_count(*mirrors) != target_reflections:
+        if len(reflection_data) != target_reflections:
             qc = qc + 1e3
         residuals = [
             qc[0] / float(qc_scale),
             qc[1] / float(qc_scale),
         ]
-        residuals.extend(fixed_length_edge_penalties(theta) / float(sigma_edge))
+        hits = reflection_data if include_edge_ends else reflection_data[1:-1]
+        if len(reflection_data) == target_reflections and len(hits) == expected_u_count:
+            penalties = np.array([
+                edge_penalty(hit["u"], u_min=float(u_min) - u_tolerance,
+                             u_max=float(u_max) + u_tolerance)
+                for hit in hits
+            ], dtype=float)
+        else:
+            penalties = np.full(expected_u_count, 100.0, dtype=float)
+        residuals.extend(penalties / float(sigma_edge))
         if correction_regularization > 0:
             residuals.extend((np.array(theta, dtype=float) - np.array(theta_pred, dtype=float)) / correction_regularization)
         return np.array(residuals, dtype=float)
 
-    def correct_to_center(theta_pred):
-        res = least_squares(
-            fun=lambda theta: correction_residual(theta, theta_pred),
-            x0=np.array(theta_pred, dtype=float),
-            loss="linear",
-            f_scale=1.0,
-            x_scale="jac",
-            max_nfev=max_corrector_nfev,
-            ftol=1e-10,
-            xtol=1e-10,
-            gtol=1e-10,
-        )
-        payload = state_payload(res.x, 0.0)
-        ok, reason = validate_payload(payload)
-        return ok, res.x, payload, reason, res
+    predictor_accept_count = 0
+    corrector_solve_count = 0
 
-    def nullspace_direction(theta, desired):
-        jac = quadcell_angle_jacobian(
-            *M_start,
-            angles=theta,
-            step_deg=jacobian_step_deg,
-            active_actuators=angle_labels,
-        )["jacobian"]
+    def correct_to_center(theta_pred):
+        nonlocal predictor_accept_count, corrector_solve_count
+        payload = state_payload(theta_pred, 0.0, include_jacobian=False)
+        ok, reason = validate_payload(payload)
+        predictor_centered = payload["qc_max_abs"] <= min(qc_tolerance, 1e-6)
+        if ok and predictor_centered:
+            # Interior nullspace predictions are often already centered. Keep
+            # those exact validated states without an unnecessary local solve.
+            predictor_accept_count += 1
+            corrected = np.array(theta_pred, dtype=float)
+            res = None
+        else:
+            corrector_solve_count += 1
+            res = least_squares(
+                fun=lambda theta: correction_residual(theta, theta_pred),
+                x0=np.array(theta_pred, dtype=float),
+                loss="linear",
+                f_scale=1.0,
+                x_scale="jac",
+                max_nfev=max_corrector_nfev,
+                ftol=1e-10,
+                xtol=1e-10,
+                gtol=1e-10,
+            )
+            corrected = res.x
+            payload = state_payload(corrected, 0.0, include_jacobian=False)
+            ok, reason = validate_payload(payload)
+        if ok:
+            payload["jacobian"] = quadcell_angle_jacobian(
+                *M_start, angles=corrected, step_deg=jacobian_step_deg,
+                active_actuators=angle_labels,
+            )["jacobian"]
+        return ok, corrected, payload, reason, res
+
+    def nullspace_direction(jac, desired):
         _, singular_values, vh = np.linalg.svd(jac, full_matrices=True)
         rank = int(np.sum(singular_values > 1e-10))
         nullspace = vh[rank:].T
@@ -5877,7 +6125,7 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
             "step_deg": float(step_deg),
         }
 
-    initial_direction, singular_values = nullspace_direction(start_angles, preferred)
+    initial_direction, singular_values = nullspace_direction(start_payload["jacobian"], preferred)
     if initial_direction is None:
         return {
             "success": False,
@@ -5900,11 +6148,22 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
     def trace_branch(sign):
         branch_points = []
         current = start_angles.copy()
+        current_payload = start_payload
         previous_direction = sign * initial_direction
         coordinate = 0.0
         stop_reason = None
+        branch_t0 = time.perf_counter()
+        last_progress_t = branch_t0
         for _ in range(n_steps):
-            direction, _ = nullspace_direction(current, previous_direction)
+            if profile_callback is not None:
+                now = time.perf_counter()
+                if now - last_progress_t >= 5.0:
+                    profile_callback(
+                        f"centered line in_progress direction={int(sign):+d} points={len(branch_points)} "
+                        f"arc_length_deg={coordinate:.6g} elapsed={now - branch_t0:.1f}s"
+                    )
+                    last_progress_t = now
+            direction, _ = nullspace_direction(current_payload["jacobian"], previous_direction)
             if direction is None:
                 stop_reason = "no nullspace direction"
                 break
@@ -5920,11 +6179,22 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
             if delta_norm <= 1e-12:
                 stop_reason = "corrector produced zero motion"
                 break
+            forward_progress = float(np.dot(delta, direction))
+            if forward_progress <= 0:
+                stop_reason = "corrector produced no forward progress"
+                break
             coordinate += delta_norm
             payload["coordinate"] = float(sign * coordinate)
             payload["predictor_direction"] = direction
             branch_points.append(payload)
+            if forward_progress < min_progress_deg:
+                stop_reason = (
+                    f"endpoint progress {forward_progress:.4g} deg below "
+                    f"min_progress_deg={min_progress_deg:.4g}"
+                )
+                break
             current = corrected
+            current_payload = payload
             previous_direction = delta / delta_norm
         else:
             stop_reason = f"step limit {n_steps} reached"
@@ -5958,6 +6228,9 @@ def trace_centered_quadcell_angle_curve(M1, M2, M3, M4,
         "accept_u_max": float(accept_u_max),
         "u_tolerance": float(u_tolerance),
         "step_deg": float(step_deg),
+        "min_progress_deg": float(min_progress_deg),
+        "predictor_accept_count": int(predictor_accept_count),
+        "corrector_solve_count": int(corrector_solve_count),
     }
 
 
@@ -6089,6 +6362,161 @@ def _mirrors_with_dangle_value(mirrors, label, value):
     return tuple(updated)
 
 
+def _quadcell_sweep_anchors(curves, sweep_value, active_axes, max_curves=3):
+    """Use arc-length positions, not dense endpoint indices, for sweep seeds."""
+    anchors = []
+    for curve in sorted(curves, key=lambda item: abs(item["sweep_value"] - sweep_value))[:max_curves]:
+        points = curve.get("points", [])
+        if not points:
+            continue
+        coordinates = np.asarray([point.get("coordinate", 0.0) for point in points])
+        for coordinate in (0.0, 0.5 * coordinates.min(), 0.5 * coordinates.max(),
+                           coordinates.min(), coordinates.max()):
+            point = points[int(np.argmin(np.abs(coordinates - coordinate)))]
+            if all(np.linalg.norm(np.asarray(point["x"]) - np.asarray(other["x"])) > 1e-9
+                   for other in anchors):
+                anchors.append(point)
+    return anchors
+
+
+def _correct_quadcell_sweep_slice(
+        base_mirrors, sweep_value, *, sweep_actuator, active_actuators,
+        target_reflections, anchors, predictor_cache=None, max_seeds=8, **options):
+    """Recover a fixed-M4 centered seed without treating one local failure as an edge."""
+    labels, axes = _active_angle_axes(active_actuators)
+    _, sweep_axes = _active_angle_axes([sweep_actuator])
+    sweep_axis = int(sweep_axes[0])
+    mirrors = _mirrors_with_dangle_value(base_mirrors, sweep_actuator, sweep_value)
+    x_base = pack_variables(*mirrors)
+    qc_tolerance = float(options.get("qc_tolerance", 0.05))
+    u_min, u_max = float(options.get("u_min", 0.1)), float(options.get("u_max", 0.9))
+    accept_min = options.get("accept_u_min")
+    accept_max = options.get("accept_u_max")
+    accept_min = u_min if accept_min is None else float(accept_min)
+    accept_max = u_max if accept_max is None else float(accept_max)
+    tolerance = float(options.get("u_tolerance", 1e-9))
+    include_ends = bool(options.get("include_edge_ends", False))
+    expected_hits = target_reflections if include_ends else max(0, target_reflections - 2)
+    cache = {}
+    predictor_cache = {} if predictor_cache is None else predictor_cache
+    attempts, guesses, evaluated = [], [], []
+
+    def evaluate(theta):
+        key = tuple(np.asarray(theta, dtype=float))
+        if key not in cache:
+            x = x_base.copy()
+            x[axes] = theta
+            count = int(get_reflection_count(*unpack_variables(x, *base_mirrors)))
+            qc = np.asarray(quadcell_errors_from_variables(x, *base_mirrors), dtype=float)
+            edge = reflection_edge_summary(x, *base_mirrors, include_ends=include_ends)
+            hits = np.asarray(edge["u_values"], dtype=float)
+            finite = bool(np.all(np.isfinite(qc)) and np.all(np.isfinite(hits)))
+            valid_branch = bool(count == target_reflections and hits.size == expected_hits and finite)
+            constraints = (np.r_[hits - accept_min + tolerance, accept_max - hits + tolerance]
+                           if valid_branch else np.full(2 * expected_hits, -1e3))
+            payload = {
+                "x": x, "angles": np.asarray(theta, dtype=float).copy(), "qc": qc,
+                "qc_norm": float(np.linalg.norm(qc)), "qc_max_abs": float(np.max(np.abs(qc))),
+                "reflection_count": count, "min_u": float(edge["min_u"]), "max_u": float(edge["max_u"]),
+                "closest_edge_margin": float(edge["closest_edge_margin"]), "reflection_u_values": hits,
+            }
+            ok = bool(valid_branch and np.all(constraints >= 0) and payload["qc_max_abs"] <= qc_tolerance)
+            cache[key] = (ok, valid_branch, constraints, payload)
+        return cache[key]
+
+    def add_guess(theta, method):
+        theta = np.asarray(theta, dtype=float)
+        if np.all(np.isfinite(theta)) and all(np.linalg.norm(theta - old[0]) > 1e-8 for old in guesses):
+            guesses.append((theta, method))
+
+    for anchor in anchors[:max_seeds]:
+        x = np.asarray(anchor["x"], dtype=float)
+        key = tuple(x)
+        if key not in predictor_cache:
+            anchor_mirrors = unpack_variables(x, *base_mirrors)
+            jac_info = quadcell_angle_jacobian(
+                *anchor_mirrors, active_actuators=labels + [sweep_actuator],
+                step_deg=options.get("jacobian_step_deg", 1e-4),
+            )
+            jac = np.asarray(jac_info["jacobian"]).copy()
+            # Do not differentiate across a reflection-count discontinuity.
+            base_qc = np.asarray(quadcell_errors_from_variables(x, *base_mirrors))
+            h = jac_info["step_deg"]
+            for column, axis in enumerate(jac_info["angle_axes"]):
+                minus, plus = jac_info["reflection_counts_minus"][column], jac_info["reflection_counts_plus"][column]
+                if minus == target_reflections and plus == target_reflections:
+                    continue
+                sign = 1 if plus == target_reflections else -1
+                probe = x.copy()
+                probe[axis] += sign * h
+                jac[:, column] = ((np.asarray(quadcell_errors_from_variables(probe, *base_mirrors)) - base_qc) / (sign * h)
+                                  if minus == target_reflections or plus == target_reflections else np.nan)
+            predictor_cache[key] = jac
+        jac = np.asarray(predictor_cache[key])
+        if np.all(np.isfinite(jac)):
+            delta = -np.linalg.lstsq(jac[:, :len(axes)], jac[:, -1], rcond=None)[0]
+            add_guess(x[axes] + delta * (sweep_value - x[sweep_axis]), "jacobian_predictor")
+        add_guess(x[axes], "neighbor_line_anchor")
+    if not guesses:
+        add_guess(x_base[axes], "base_angles")
+    corrector_names = (
+        "qc_tolerance", "u_min", "u_max", "u_tolerance", "accept_u_min", "accept_u_max",
+        "jacobian_step_deg", "qc_scale", "sigma_edge", "correction_regularization",
+        "max_corrector_nfev", "include_edge_ends",
+    )
+    corrector_options = {name: options[name] for name in corrector_names if name in options}
+    for guess, method in guesses:
+        ok, _, _, payload = evaluate(guess)
+        if ok and payload["qc_max_abs"] <= min(qc_tolerance, 1e-6):
+            return payload, {"success": True, "method": method, "attempts": attempts,
+                             "recovered": bool(attempts), "failure_reason": None}
+        try:
+            correction = correct_centered_quadcell_angles(
+                *mirrors, theta_pred=guess, target_reflections=target_reflections,
+                active_actuators=labels, **corrector_options,
+            )
+        except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+            attempts.append({"method": method, "success": False, "failure_reason": str(exc)})
+            evaluated.append(guess)
+            continue
+        attempts.append({"method": method, "success": bool(correction["success"]),
+                         "failure_reason": correction.get("failure_reason")})
+        corrected = np.asarray(correction.get("angles", guess))
+        evaluated.append(corrected)
+        if correction["success"]:
+            return correction["payload"], {"success": True, "method": method, "attempts": attempts,
+                                           "recovered": len(attempts) > 1, "failure_reason": None}
+
+    # Least-squares edge penalties are soft. Restore feasibility explicitly
+    # rather than discarding an entire M4 slice for a small u-bound violation.
+    seeds = sorted(evaluated + [guess for guess, _ in guesses], key=lambda theta: (
+        not evaluate(theta)[1], float(np.linalg.norm(np.minimum(evaluate(theta)[2], 0))),
+        evaluate(theta)[3]["qc_norm"],
+    ))
+    for guess in seeds[:3]:
+        if not evaluate(guess)[1]:
+            continue
+
+        def objective(theta):
+            _, branch, _, payload = evaluate(theta)
+            return float(payload["qc"] @ payload["qc"] / 0.01**2) if branch else 1e12
+
+        result = minimize(
+            objective, guess, method="SLSQP",
+            constraints={"type": "ineq", "fun": lambda theta: evaluate(theta)[2] - max(1e-8, 10 * tolerance)},
+            bounds=[(value - 2.0, value + 2.0) for value in guess],
+            options={"maxiter": 100, "ftol": 1e-12, "eps": 1e-7},
+        )
+        ok, _, _, payload = evaluate(result.x)
+        attempts.append({"method": "hard_u_feasibility", "success": ok, "message": str(result.message)})
+        if ok:
+            return payload, {"success": True, "method": "hard_u_feasibility", "attempts": attempts,
+                             "recovered": True, "failure_reason": None}
+    reasons = [attempt.get("failure_reason") for attempt in attempts if attempt.get("failure_reason")]
+    return None, {"success": False, "attempts": attempts, "recovered": False,
+                  "failure_reason": reasons[-1] if reasons else "No feasible centered seed found after multi-seed recovery."}
+
+
 def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
                                           target_reflections=None,
                                           N_R=None,
@@ -6102,6 +6530,10 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
                                           adaptive_sweep_refinement=False,
                                           sweep_refinement_levels=4,
                                           min_sweep_step_deg=1e-4,
+                                          sweep_expand_to_bounds=False,
+                                          sweep_max_half_span_deg=None,
+                                          sweep_max_slices=400,
+                                          sweep_seed_retries=8,
                                           preferred_axis=None,
                                           max_steps_per_side=800,
                                           step_deg=0.01,
@@ -6116,6 +6548,12 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
     For the common M1-M3 plot, keep M4 fixed at several values. Each fixed-M4
     slice is a centered-QC curve in M1/M2/M3; the collection is a surface in
     the full four-angle space.
+
+    Slices use Jacobian predictions and multiple anchors from neighboring
+    curves, with hard-u feasibility recovery. Interior failures are retried
+    after both neighbors exist. With sweep_expand_to_bounds, the half-span is
+    an initial window, extended until a boundary is bracketed or a cap/budget
+    is reached. Explicit sweep_values/offsets always retain their chosen range.
     """
     if N_R is not None:
         if target_reflections is not None and int(target_reflections) != int(N_R):
@@ -6146,6 +6584,7 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
     min_sweep_step_deg = float(abs(min_sweep_step_deg))
 
     base_sweep_value = _dangle_value_for_label(base_mirrors, sweep_actuator)
+    explicit_sweep_values = sweep_values is not None or sweep_offsets is not None
     if sweep_values is not None:
         sweep_values = np.array(sweep_values, dtype=float)
     elif sweep_offsets is not None:
@@ -6176,6 +6615,19 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
     attempted_records = []
     curves_by_value = {}
     failed_slices = []
+    predictor_cache = {}
+    profile_callback = trace_kwargs.get("profile_callback")
+    sweep_max_slices = max(1, int(sweep_max_slices))
+    sweep_seed_retries = max(1, int(sweep_seed_retries))
+    max_half_span = (max(3.0, 4 * float(sweep_half_span_deg))
+                     if sweep_max_half_span_deg is None else float(abs(sweep_max_half_span_deg)))
+    if not np.isfinite(max_half_span) or max_half_span <= 0:
+        raise ValueError("sweep_max_half_span_deg must be finite and positive.")
+    if sweep_expand_to_bounds and not explicit_sweep_values and max_half_span < sweep_half_span_deg:
+        raise ValueError("sweep_max_half_span_deg must cover the initial sweep_half_span_deg.")
+    extent_status = {"negative": "configured_window", "positive": "configured_window"}
+    nominal_gap = (float(np.max(np.diff(np.sort(initial_sweep_values))))
+                   if len(initial_sweep_values) > 1 else max(0.01, float(sweep_half_span_deg)))
 
     def already_attempted(sweep_value):
         return any(
@@ -6183,30 +6635,32 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
             for record in attempted_records
         )
 
-    def trace_sweep_slice(sweep_value, source="initial", refinement_level=0):
+    def trace_sweep_slice(sweep_value, source="initial", refinement_level=0, retry=False):
         sweep_value = float(sweep_value)
-        if already_attempted(sweep_value):
+        previous_record = next((record for record in attempted_records
+                                if abs(record["sweep_value"] - sweep_value) <= 1e-12), None)
+        if previous_record is not None and (not retry or previous_record["success"]):
+            return None
+        if previous_record is None and len(attempted_records) >= sweep_max_slices:
             return None
         slice_mirrors = _mirrors_with_dangle_value(base_mirrors, sweep_actuator, sweep_value)
-        successful_curves = list(curves_by_value.values())
-        if successful_curves:
-            nearest_curve = min(
-                successful_curves,
-                key=lambda curve: abs(float(curve["sweep_value"]) - sweep_value),
-            )
-            nearest_coordinates = np.array(nearest_curve.get("coordinates", []), dtype=float)
-            nearest_start_index = (
-                0 if nearest_coordinates.size == 0
-                else int(np.argmin(np.abs(nearest_coordinates)))
-            )
-            start_angles = np.array(nearest_curve["points"][nearest_start_index]["angles"], dtype=float)
-        else:
-            start_angles = base_active_angles
-
-        curve = trace_full_centered_quadcell_angle_curve(
+        anchors = _quadcell_sweep_anchors(list(curves_by_value.values()), sweep_value, active_axes)
+        if not anchors:
+            anchors = [{"x": x_base}]
+        seed, recovery = _correct_quadcell_sweep_slice(
+            base_mirrors, sweep_value, sweep_actuator=sweep_actuator, active_actuators=active_labels,
+            target_reflections=target_reflections, anchors=anchors, predictor_cache=predictor_cache,
+            max_seeds=sweep_seed_retries, qc_tolerance=qc_tolerance,
+            u_min=u_min, u_max=u_max, accept_u_min=accept_u_min, accept_u_max=accept_u_max,
+            **trace_kwargs,
+        )
+        curve_options = dict(trace_kwargs)
+        curve_options.setdefault("auto_center_start", False)
+        curve = ({"success": False, "points": [], "failure_reason": recovery["failure_reason"]}
+                 if seed is None else trace_full_centered_quadcell_angle_curve(
             *slice_mirrors,
             target_reflections=target_reflections,
-            start_angles=start_angles,
+            start_angles=np.asarray(seed["x"])[active_axes],
             active_actuators=active_labels,
             preferred_axis=preferred_axis,
             max_steps_per_side=max_steps_per_side,
@@ -6216,8 +6670,8 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
             u_max=u_max,
             accept_u_min=accept_u_min,
             accept_u_max=accept_u_max,
-            **trace_kwargs,
-        )
+            **curve_options,
+        ))
         curve["sweep_actuator"] = sweep_actuator
         curve["sweep_value"] = sweep_value
         curve["slice_mirrors"] = slice_mirrors
@@ -6227,14 +6681,23 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
 
         success = bool(curve.get("success") and len(curve.get("points", [])) > 0)
         record = {
-            "slice_index": int(len(attempted_records)),
+            "slice_index": (int(len(attempted_records)) if previous_record is None
+                            else previous_record["slice_index"]),
             "sweep_value": sweep_value,
             "success": success,
             "source": source,
             "refinement_level": int(refinement_level),
             "failure_reason": None if success else curve.get("failure_reason", "unknown failure"),
+            "recovery": recovery,
         }
-        attempted_records.append(record)
+        if previous_record is None:
+            attempted_records.append(record)
+        else:
+            previous_record.update(record)
+        if profile_callback is not None:
+            profile_callback(f"M4 slice {sweep_value:.7f} {'OK' if success else 'failed'} "
+                             f"source={source} seeds={len(recovery['attempts'])} "
+                             f"reason={record['failure_reason']}")
         curve["sweep_source"] = source
         curve["sweep_refinement_level"] = int(refinement_level)
         curve["sweep_slice_index"] = int(record["slice_index"])
@@ -6258,13 +6721,49 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
     for sweep_value in ordered_initial_values:
         trace_sweep_slice(sweep_value, source="initial", refinement_level=0)
 
+    if sweep_expand_to_bounds and not explicit_sweep_values and curves_by_value and sweep_half_span_deg > 0:
+        for sign, name in ((-1, "negative"), (1, "positive")):
+            edge = min(initial_sweep_values) if sign < 0 else max(initial_sweep_values)
+            record = next((record for record in attempted_records if abs(record["sweep_value"] - edge) < 1e-12), None)
+            if record is None:
+                extent_status[name] = "slice_budget_reached"
+                continue
+            stride = max(min_sweep_step_deg, nominal_gap)
+            while record["success"] and abs(edge - base_sweep_value) < max_half_span - 1e-12:
+                trial = base_sweep_value + sign * min(max_half_span, abs(edge - base_sweep_value) + stride)
+                record = trace_sweep_slice(trial, source="extent_expansion")
+                if record is None:
+                    extent_status[name] = "slice_budget_reached"
+                    break
+                edge = trial
+                stride = min(max(nominal_gap, 0.1), stride * 1.5)
+            else:
+                extent_status[name] = "search_cap_reached" if record["success"] else "boundary_bracketed"
+
+    # Retry interior failures after both neighboring lines are available.
+    # Their endpoints can seed feasible parts of a slice missed from its center.
+    for _ in range(2):
+        if not curves_by_value:
+            break
+        low, high = min(curves_by_value), max(curves_by_value)
+        recovered = False
+        for record in list(attempted_records):
+            if not record["success"] and low < record["sweep_value"] < high:
+                retry_record = trace_sweep_slice(record["sweep_value"], source="gap_recovery", retry=True)
+                recovered = recovered or bool(retry_record and retry_record["success"])
+        if not recovered:
+            break
+
     sweep_refinement_events = []
     if adaptive_sweep_refinement and sweep_refinement_levels > 0:
         for refinement_level in range(1, sweep_refinement_levels + 1):
             sorted_records = sorted(attempted_records, key=lambda record: record["sweep_value"])
             new_values = []
             for left, right in zip(sorted_records[:-1], sorted_records[1:]):
-                if left["success"] == right["success"]:
+                inside = bool(curves_by_value and min(curves_by_value) < left["sweep_value"]
+                              and right["sweep_value"] < max(curves_by_value))
+                if left["success"] == right["success"] and not (
+                        inside and not left["success"] and refinement_level == 1):
                     continue
                 gap = float(right["sweep_value"] - left["sweep_value"])
                 if gap <= min_sweep_step_deg:
@@ -6302,6 +6801,11 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
         dtype=float,
     )
     successful_sweep_values = np.array([curve["sweep_value"] for curve in curves], dtype=float)
+    failed_slices = [dict(record) for record in attempted_records if not record["success"]]
+    interior_failures = [record["sweep_value"] for record in failed_slices
+                         if curves and min(curves_by_value) < record["sweep_value"] < max(curves_by_value)]
+    line_limit_reached = any("step limit" in str(curve.get(key, ""))
+                             for curve in curves for key in ("negative_stop_reason", "positive_stop_reason"))
     include_edge_ends = bool(trace_kwargs.get("include_edge_ends", False))
     base_qc = np.array(quadcell_errors_from_variables(x_base, *base_mirrors), dtype=float)
     base_edge_summary = reflection_edge_summary(x_base, *base_mirrors, include_ends=include_edge_ends)
@@ -6332,6 +6836,17 @@ def trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
         "min_sweep_step_deg": float(min_sweep_step_deg),
         "sweep_refinement_events": sweep_refinement_events,
         "sweep_slice_records": attempted_records,
+        "sweep_expand_to_bounds": bool(sweep_expand_to_bounds),
+        "sweep_extent_status": extent_status,
+        "sweep_max_half_span_deg": max_half_span,
+        "sweep_max_slices": sweep_max_slices,
+        "sweep_seed_retries": sweep_seed_retries,
+        "unresolved_interior_slices": interior_failures,
+        "coverage_limited": bool(interior_failures or line_limit_reached or
+                                 any("reached" in value for value in extent_status.values()) or
+                                 len(attempted_records) >= sweep_max_slices),
+        "line_limit_reached": line_limit_reached,
+        "coverage_scope": "multi-seed sampled region; no global feasibility proof",
         "base_sweep_value": float(base_sweep_value),
         "base_active_angles": np.array(base_active_angles, dtype=float),
         "base_mirrors": base_mirrors,
@@ -6384,6 +6899,7 @@ def solve_and_trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
                                                     u_max=0.9,
                                                     accept_u_min=None,
                                                     accept_u_max=None,
+                                                    center_retry_angle_scales=DEFAULT_CENTER_RETRY_ANGLE_SCALES,
                                                     **trace_kwargs):
     """Find a centered fixed-N_R config, then trace fixed-actuator slices."""
     if N_R is not None:
@@ -6402,7 +6918,8 @@ def solve_and_trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
     if accept_u_min > accept_u_max:
         raise ValueError("accept_u_min must be <= accept_u_max.")
 
-    centered_mirrors, center_res = center_quadcells(
+    center_t0 = time.perf_counter()
+    centered_mirrors, center_res = _center_quadcells_with_retries(
         M1,
         M2,
         M3,
@@ -6410,6 +6927,7 @@ def solve_and_trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
         N_R=int(target_reflections),
         n_tries=center_n_tries,
         angle_perturb=center_angle_perturb,
+        center_retry_angle_scales=center_retry_angle_scales,
         seed=center_seed,
         u_min=center_u_min,
         u_max=center_u_max,
@@ -6419,7 +6937,10 @@ def solve_and_trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
         final_u_tolerance=center_final_u_tolerance,
         final_u_min=accept_u_min,
         final_u_max=accept_u_max,
+        profile_callback=trace_kwargs.get("profile_callback"),
     )
+    center_elapsed_s = time.perf_counter() - center_t0
+    trace_t0 = time.perf_counter()
     surface = trace_centered_quadcell_angle_surface(
         *centered_mirrors,
         target_reflections=int(target_reflections),
@@ -6443,10 +6964,13 @@ def solve_and_trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
         accept_u_max=accept_u_max,
         **trace_kwargs,
     )
+    surface["center_elapsed_s"] = center_elapsed_s
+    surface["trace_elapsed_s"] = time.perf_counter() - trace_t0
     surface["centered_mirrors"] = centered_mirrors
     surface["center_result"] = center_res
+    surface["center_search_attempts"] = center_res.center_search_attempts
     surface["center_n_tries"] = int(center_n_tries)
-    surface["center_angle_perturb"] = float(center_angle_perturb)
+    surface["center_angle_perturb"] = float(center_res.center_angle_perturb_used)
     surface["center_seed"] = None if center_seed is None else int(center_seed)
     surface["center_enforce_final_u_bounds"] = bool(center_enforce_final_u_bounds)
     surface["center_final_u_tolerance"] = float(center_final_u_tolerance)
@@ -6459,6 +6983,765 @@ def solve_and_trace_centered_quadcell_angle_surface(M1, M2, M3, M4,
     return centered_mirrors, center_res, surface
 
 
+def scan_reflection_count_sweep_reacquisition(
+        M1, M2, M3, M4, target_N_R, *, sweep_actuator="M4.dangle",
+        qc_reacquire_limit=0.7, angle_scan_limit=1.0, scan_samples=1001,
+        stop_mode="window", center_tolerance=0.0, u_min=0.1, u_max=0.9):
+    """Check the first QC return in both directions with other mirrors fixed.
+
+    A later target-N_R crossing is not usable if an earlier visible branch
+    would already stop execution at the wrong reflection count.
+    """
+    labels, axes = _active_angle_axes([sweep_actuator])
+    axis = int(axes[0])
+    x_start = pack_variables(M1, M2, M3, M4)
+    base = (M1, M2, M3, M4)
+    target_N_R = int(target_N_R)
+    if stop_mode not in {"window", "center_crossing"}:
+        raise ValueError("stop_mode must be 'window' or 'center_crossing'.")
+    if not np.isfinite(angle_scan_limit) or angle_scan_limit <= 0:
+        raise ValueError("angle_scan_limit must be finite and positive.")
+    if not np.isfinite(qc_reacquire_limit) or qc_reacquire_limit <= 0:
+        raise ValueError("qc_reacquire_limit must be finite and positive.")
+    if not np.isfinite(center_tolerance) or center_tolerance < 0:
+        raise ValueError("center_tolerance must be finite and nonnegative.")
+    start_N_R = int(get_reflection_count(*base))
+    amounts = np.linspace(0.0, float(angle_scan_limit), max(3, int(scan_samples)))[1:]
+    directions = []
+    candidates = []
+    for direction in (1, -1):
+        record = {"direction": direction, "count_sequence": [start_N_R], "success": False}
+        departed = False
+        returned = False
+        previous_qc = None
+        for amount_abs in amounts:
+            amount = direction * float(amount_abs)
+            x = variables_with_axis_move(x_start, axis, amount)
+            mirrors = unpack_variables(x, *base)
+            count = int(get_reflection_count(*mirrors))
+            if count != record["count_sequence"][-1]:
+                record["count_sequence"].append(count)
+            qc = np.array(quadcell_errors_from_variables(x, *base), dtype=float)
+            visible = bool(np.all(np.isfinite(qc)) and np.max(np.abs(qc)) <= qc_reacquire_limit)
+            if not visible:
+                if returned:
+                    record["failure_reason"] = "First target QC window passed without a center crossing."
+                    break
+                departed = True
+                previous_qc = None
+                continue
+            if not departed:
+                continue
+            if not returned:
+                returned = True
+                record.update(first_return_N_R=count, first_return_angle_delta=amount)
+            if count != target_N_R:
+                record["failure_reason"] = f"First QC return has N_R={count}, not {target_N_R}."
+                break
+            crossed = np.zeros(2, dtype=bool) if previous_qc is None else np.sign(previous_qc) * np.sign(qc) < 0
+            centered = np.abs(qc) <= center_tolerance
+            if stop_mode == "window" or np.any(crossed | centered):
+                edge = reflection_edge_summary(x, *base, include_ends=False)
+                if edge["min_u"] < u_min - 1e-9 or edge["max_u"] > u_max + 1e-9:
+                    record["rejected_stop"] = {
+                        "angle_delta": float(amount), "x": x.copy(), "qc": qc.copy(),
+                        "N_R": count, "min_u": float(edge["min_u"]), "max_u": float(edge["max_u"]),
+                        "u_min": float(u_min), "u_max": float(u_max),
+                    }
+                    record["failure_reason"] = "First target QC stop violates reflection-u bounds."
+                    break
+                record.update(success=True, angle_delta=amount, x=x, qc=qc, N_R=count,
+                              center_crossed_mask=(crossed | centered).tolist())
+                candidates.append(record)
+                break
+            previous_qc = qc
+        record.setdefault("failure_reason", None if record["success"] else "No usable first QC return within scan limit.")
+        directions.append(record)
+    best = min(candidates, key=lambda item: abs(item["angle_delta"])) if candidates else None
+    return {
+        "success": best is not None, "start_N_R": start_N_R, "target_N_R": target_N_R,
+        "actuator": labels[0], "axis_index": axis, "start_x": x_start,
+        "selected": best, "directions": directions,
+        "failure_reason": None if best is not None else "; ".join(
+            f"direction {record['direction']:+d}: {record['failure_reason']}" for record in directions
+        ),
+    }
+
+
+def _quadcell_corner_surface_angles(model, coefficients):
+    """Evaluate a fitted boundary plane or legacy four-corner patch in 4D."""
+    if "boundary_polygon2" in model:
+        return model["boundary_origin4"] + model["boundary_basis4"] @ np.asarray(coefficients)
+    along, across = np.asarray(coefficients, dtype=float)
+    c0, c1, c2, c3 = np.asarray(model["corners4"], dtype=float)
+    low = (1.0 - along) * c0 + along * c1
+    high = (1.0 - along) * c3 + along * c2
+    return (1.0 - across) * low + across * high
+
+
+def _project_quadcell_corner_surface(model, target_angles4, metric_indices):
+    target = np.asarray(target_angles4, dtype=float)
+    indices = np.asarray(metric_indices, dtype=int)
+
+    if "boundary_polygon2" in model:
+        origin, basis = model["boundary_origin4"], model["boundary_basis4"]
+        polygon = model["boundary_polygon2"]
+        equations = model["boundary_equations2"]
+        seed = np.clip(np.linalg.lstsq(basis[indices], (target - origin)[indices], rcond=None)[0], 0, 1)
+
+        def objective(coefficients):
+            delta = (origin + basis @ coefficients - target)[indices]
+            return float(delta @ delta)
+
+        if np.any(equations[:, :2] @ seed + equations[:, 2] > 1e-9):
+            seed = polygon.mean(axis=0)
+        result = minimize(
+            objective, seed, method="SLSQP", bounds=[(0, 1), (0, 1)],
+            jac=lambda coefficients: 2 * basis[indices].T @ (origin + basis @ coefficients - target)[indices],
+            constraints={"type": "ineq", "fun": lambda coefficients: -(
+                equations[:, :2] @ coefficients + equations[:, 2]),
+                "jac": lambda coefficients: -equations[:, :2]},
+            options={"ftol": 1e-14, "maxiter": 100},
+        )
+        return result.x, result
+
+    def objective(coefficients):
+        delta = (_quadcell_corner_surface_angles(model, coefficients) - target)[indices]
+        return float(delta @ delta)
+
+    def gradient(coefficients):
+        along, across = coefficients
+        c0, c1, c2, c3 = np.asarray(model["corners4"], dtype=float)
+        derivatives = np.column_stack((
+            (1 - across) * (c1 - c0) + across * (c2 - c3),
+            (1 - along) * (c3 - c0) + along * (c2 - c1),
+        ))
+        delta = (_quadcell_corner_surface_angles(model, coefficients) - target)[indices]
+        return 2 * derivatives[indices].T @ delta
+
+    results = [minimize(
+        objective, seed, jac=gradient, method="L-BFGS-B", bounds=[(0.0, 1.0), (0.0, 1.0)],
+        options={"ftol": 1e-15, "gtol": 1e-12},
+    ) for seed in ((0.5, 0.5), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))]
+    best = min(results, key=lambda result: objective(result.x))
+    return np.clip(best.x, 0.0, 1.0), best
+
+
+def _quadcell_corner_surface_candidates(projected, samples, extra=(), model=None):
+    if model is not None and "boundary_polygon2" in model:
+        polygon = model["boundary_polygon2"]
+        equations = model["boundary_equations2"]
+        candidates = [projected, *extra, polygon.mean(axis=0), *polygon]
+        if samples > 1:
+            candidates += [np.array([s, t]) for s in np.linspace(max(0, projected[0] - .15), min(1, projected[0] + .15), samples)
+                           for t in np.linspace(max(0, projected[1] - .15), min(1, projected[1] + .15), samples)]
+        return list({tuple(np.round(value, 12)): np.asarray(value) for value in candidates
+                     if np.all(equations[:, :2] @ value + equations[:, 2] <= 1e-9)}.values())
+    along, across = np.asarray(projected, dtype=float)
+    candidates = [projected, *extra, (0.5, 0.5), (0, 0), (1, 0), (1, 1), (0, 1),
+                  (0, across), (1, across), (along, 0), (along, 1)]
+    if samples > 1:
+        for s in np.linspace(max(0, along - 0.15), min(1, along + 0.15), samples):
+            for t in np.linspace(max(0, across - 0.15), min(1, across + 0.15), samples):
+                candidates.append((s, t))
+    unique = {}
+    for candidate in candidates:
+        candidate = np.clip(candidate, 0.0, 1.0)
+        unique.setdefault(tuple(np.round(candidate, 12)), candidate)
+    return list(unique.values())
+
+
+def _refine_quadcell_surface_boundary(base, points, target_reflections, sweep_axis, options, sweep_bounds=None):
+    """Find boundary support points without densely tracing all M4 slices."""
+    axes4 = np.array([1, 3, 5, 7])
+    angles = np.array([np.asarray(point["x"])[axes4] for point in points])
+    origin = angles.mean(axis=0)
+    _, _, vh = np.linalg.svd(angles - origin, full_matrices=False)
+    if len(vh) < 2:
+        return points, []
+    minimum, maximum = angles.min(axis=0), angles.max(axis=0)
+    padding = np.maximum(0.02, 0.25 * (maximum - minimum))
+    lower, upper = minimum - padding, maximum + padding
+    sweep_index = list(axes4).index(sweep_axis)
+    if sweep_bounds is not None:
+        lower[sweep_index], upper[sweep_index] = sweep_bounds
+    u_min = options.get("accept_u_min")
+    u_max = options.get("accept_u_max")
+    u_min = float(options.get("u_min", 0.1) if u_min is None else u_min)
+    u_max = float(options.get("u_max", 0.9) if u_max is None else u_max)
+    qc_tolerance = float(options.get("qc_tolerance", 0.05))
+    include_ends = bool(options.get("include_edge_ends", False))
+    expected_hits = target_reflections if include_ends else max(0, target_reflections - 2)
+    x_base = pack_variables(*base)
+    cache = {}
+
+    def evaluate(delta):
+        key = tuple(delta)
+        if key not in cache:
+            x = x_base.copy()
+            x[axes4] = origin + delta
+            count = int(get_reflection_count(*unpack_variables(x, *base)))
+            qc = np.asarray(quadcell_errors_from_variables(x, *base), dtype=float)
+            edge = reflection_edge_summary(x, *base, include_ends=include_ends)
+            hits = np.asarray(edge["u_values"])
+            branch = (count == target_reflections and hits.size == expected_hits and
+                      np.all(np.isfinite(qc)) and np.all(np.isfinite(hits)))
+            constraints = (np.r_[hits - u_min - 1e-8, u_max - 1e-8 - hits]
+                           if branch else np.full(2 * expected_hits, -1e3))
+            cache[key] = x, qc, edge, constraints, branch
+        return cache[key]
+
+    output = list(points)
+    diagnostics = []
+    directions = [np.array([np.cos(angle), np.sin(angle)]) @ vh[:2]
+                  for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False)]
+    sweep_direction = np.eye(4)[sweep_index]
+    directions.extend((sweep_direction, -sweep_direction))
+    for direction in directions:
+        candidates = np.array([np.asarray(point["x"])[axes4] for point in output])
+        seed = candidates[int(np.argmax(candidates @ direction))] - origin
+        result = minimize(
+            lambda delta: -float(direction @ delta), seed, jac=lambda delta: -direction,
+            method="SLSQP", bounds=list(zip(lower - origin, upper - origin)),
+            constraints=[{"type": "eq", "fun": lambda delta: evaluate(delta)[1] / 0.01},
+                         {"type": "ineq", "fun": lambda delta: evaluate(delta)[3]}],
+            options={"maxiter": 80, "ftol": 1e-12, "eps": 1e-7},
+        )
+        x, qc, edge, constraints, branch = evaluate(result.x)
+        valid = bool(branch and np.max(np.abs(qc)) <= qc_tolerance and np.all(constraints >= -1e-10))
+        diagnostics.append({"success": valid, "optimizer_success": bool(result.success), "message": str(result.message)})
+        if valid:
+            output.append({"x": x, "angles": x[[1, 3, 5]], "coordinate": 0.0,
+                           "qc": qc, "qc_max_abs": float(np.max(np.abs(qc))),
+                           "reflection_count": target_reflections, "min_u": edge["min_u"],
+                           "max_u": edge["max_u"], "closest_edge_margin": edge["closest_edge_margin"]})
+    return output, diagnostics
+
+
+def _fit_quadcell_boundary_corners(points):
+    """Keep four well-separated boundary vertices even when M4 tips collapse."""
+    unique = {}
+    for point in points:
+        unique.setdefault(tuple(np.round(np.asarray(point["x"])[[1, 3, 5, 7]], 12)), point)
+    points = list(unique.values())
+    angles = np.asarray([np.asarray(point["x"])[[1, 3, 5, 7]] for point in points])
+    origin = angles.mean(axis=0)
+    _, singular, vh = np.linalg.svd(angles - origin, full_matrices=False)
+    if len(singular) < 2 or singular[1] <= 1e-10:
+        return None
+    coordinates = (angles - origin) @ vh[:2].T
+    try:
+        hull = ConvexHull(coordinates)
+    except QhullError:
+        return None
+    vertices = hull.vertices
+    if len(vertices) > 32:
+        directions = np.column_stack((np.cos(np.linspace(0, 2 * np.pi, 32, endpoint=False)),
+                                      np.sin(np.linspace(0, 2 * np.pi, 32, endpoint=False))))
+        selected = set(vertices[np.argmax(coordinates[vertices] @ directions.T, axis=0)])
+        vertices = np.asarray([index for index in vertices if index in selected])
+    if len(vertices) == 3:
+        best = np.r_[vertices, vertices[-1]]
+        area = hull.volume
+    else:
+        combinations = np.asarray(list(itertools.combinations(vertices, 4)))
+        quads = coordinates[combinations]
+        areas = 0.5 * np.abs(np.sum(
+            quads[:, :, 0] * np.roll(quads[:, :, 1], -1, axis=1) -
+            quads[:, :, 1] * np.roll(quads[:, :, 0], -1, axis=1), axis=1))
+        index = int(np.argmax(areas))
+        best, area = combinations[index], float(areas[index])
+    minimum, maximum = coordinates.min(axis=0), coordinates.max(axis=0)
+    scales = maximum - minimum
+    polygon = (coordinates[hull.vertices] - minimum) / scales
+    return {"corner_points": [points[index] for index in best],
+            "boundary_hull_angles4": angles[hull.vertices],
+            "boundary_origin4": origin + vh[:2].T @ minimum,
+            "boundary_basis4": vh[:2].T * scales,
+            "boundary_polygon2": polygon,
+            "boundary_equations2": ConvexHull(polygon).equations,
+            "corner_area_fraction": float(area / hull.volume)}
+
+
+def _trace_centered_quadcell_corner_surface(
+        M1, M2, M3, M4, *, target_reflections, active_actuators, sweep_actuator,
+        preferred_axis, line_max_steps_per_side, line_step_deg,
+        sweep_half_span_deg, sweep_step_deg, sweep_refinement_levels,
+        sweep_expand_to_bounds=True, sweep_max_half_span_deg=None,
+        sweep_min_step_deg=1e-4, sweep_max_slices=400,
+        profile_callback=None, **corrector_options):
+    """Recover the M4 extent and trace its two boundary lines, not a dense grid."""
+    if sweep_max_half_span_deg is not None and (not np.isfinite(sweep_max_half_span_deg) or sweep_max_half_span_deg <= 0):
+        raise ValueError("sweep_max_half_span_deg must be finite and positive.")
+    if not np.isfinite(sweep_min_step_deg) or sweep_min_step_deg < 0:
+        raise ValueError("sweep_min_step_deg must be finite and nonnegative.")
+    mirrors = tuple(np.asarray(mirror, dtype=float) for mirror in (M1, M2, M3, M4))
+    angle_axes4 = np.array([1, 3, 5, 7])
+    _, active_axes = _active_angle_axes(active_actuators)
+    sweep_index = ["M1.dangle", "M2.dangle", "M3.dangle", "M4.dangle"].index(sweep_actuator)
+    timing = {}
+    output = {"success": False, "failure_reason": None, "planner_timing": timing}
+
+    def log(message):
+        if profile_callback is not None:
+            profile_callback(message)
+
+    def trace_line(seed_mirrors, center_start=True):
+        return trace_full_centered_quadcell_angle_curve(
+            *seed_mirrors, target_reflections=target_reflections,
+            active_actuators=active_actuators, preferred_axis=preferred_axis,
+            max_steps_per_side=line_max_steps_per_side, step_deg=line_step_deg,
+            auto_center_start=center_start,
+            profile_callback=profile_callback, **corrector_options,
+        )
+
+    started = time.perf_counter()
+    log("line_trace begin")
+    center_line = trace_line(mirrors)
+    if not center_line.get("success") or not center_line.get("points"):
+        recovered, recovery = _correct_quadcell_sweep_slice(
+            mirrors, _dangle_value_for_label(mirrors, sweep_actuator), sweep_actuator=sweep_actuator,
+            active_actuators=active_actuators, target_reflections=target_reflections,
+            anchors=[{"x": pack_variables(*mirrors)}], **corrector_options,
+        )
+        if recovered is not None:
+            center_line = trace_line(unpack_variables(recovered["x"], *mirrors), center_start=False)
+        output["center_recovery"] = recovery
+    timing["line_trace"] = time.perf_counter() - started
+    output["line_curve"] = center_line
+    if not center_line.get("success") or not center_line.get("points"):
+        output["failure_reason"] = "Could not trace centered line: " + str(center_line.get("failure_reason"))
+        return output
+    coordinates = np.asarray(center_line.get("coordinates", []))
+    center_index = int(np.argmin(np.abs(coordinates))) if coordinates.size else 0
+    center = dict(center_line["points"][center_index])
+    center_x = np.asarray(center["x"], dtype=float)
+    base_sweep = float(center_x[angle_axes4[sweep_index]])
+    center.update(angles4=center_x[angle_axes4], sweep_value=base_sweep)
+    log(f"line_trace done dt={timing['line_trace']:.3f}s points={len(center_line['points'])}")
+
+    predictor_cache = {}
+    sweep_records = []
+    support_curves = [dict(center_line, sweep_value=base_sweep)]
+
+    def correct_sweep(value, anchors):
+        point, recovery = _correct_quadcell_sweep_slice(
+            mirrors, value, sweep_actuator=sweep_actuator, active_actuators=active_actuators,
+            target_reflections=target_reflections, anchors=anchors,
+            predictor_cache=predictor_cache, **corrector_options,
+        )
+        sweep_records.append({"sweep_value": value, "success": point is not None, "recovery": recovery})
+        if point is None:
+            return None, recovery["failure_reason"]
+        point = dict(point)
+        point.update(angles4=np.asarray(point["x"])[angle_axes4],
+                     sweep_value=float(value), coordinate=float(value - base_sweep))
+        return point, None
+
+    def sweep_branch(sign):
+        branch = []
+        current, current_point = base_sweep, center
+        if sweep_half_span_deg <= 0 or sweep_step_deg <= 0:
+            return branch, "zero sweep span"
+        limit = (max(3.0, 4 * sweep_half_span_deg) if sweep_max_half_span_deg is None
+                 else float(abs(sweep_max_half_span_deg))) if sweep_expand_to_bounds else sweep_half_span_deg
+        # Full tracing finishes the bracket with constrained support solves;
+        # do not spend dozens of local corrections asymptoting at each tip.
+        levels = min(4, sweep_refinement_levels) if sweep_expand_to_bounds else sweep_refinement_levels
+        min_step = max(float(sweep_min_step_deg), sweep_step_deg / 2**levels)
+        step_size = float(sweep_step_deg)
+        anchor_curves = [dict(center_line, sweep_value=base_sweep)]
+        extended_anchors = False
+        last_failure = None
+        last_progress = time.perf_counter()
+        while len(sweep_records) < sweep_max_slices:
+            remaining = limit - abs(current - base_sweep)
+            if remaining <= 1e-12:
+                return branch, "search cap reached" if sweep_expand_to_bounds else "sweep half-span reached"
+            trial = current + sign * min(step_size, remaining)
+            anchors = [current_point] + _quadcell_sweep_anchors(anchor_curves, trial, active_axes)
+            point, reason = correct_sweep(trial, anchors)
+            if point is None and not extended_anchors and branch:
+                # A center track can hit an edge before the whole slice does.
+                # Recover from points distributed along the last valid line.
+                curve = trace_line(unpack_variables(current_point["x"], *mirrors), center_start=False)
+                if curve.get("success") and curve.get("points"):
+                    anchor_curves.insert(0, dict(curve, sweep_value=current))
+                    support_curves.append(dict(curve, sweep_value=current))
+                    anchors = [current_point] + _quadcell_sweep_anchors(anchor_curves, trial, active_axes)
+                    point, reason = correct_sweep(trial, anchors)
+                extended_anchors = True
+            if point is not None:
+                branch.append(point)
+                current, current_point = trial, point
+                step_size = min(sweep_step_deg, step_size * 2)
+            else:
+                last_failure = reason
+                if min(step_size, remaining) <= min_step * (1 + 1e-9):
+                    return branch, "multi-seed boundary bracket: " + str(last_failure)
+                step_size = max(min_step, min(step_size, remaining) / 2)
+            if time.perf_counter() - last_progress >= 5:
+                log(f"sweep_trace in_progress direction={sign:+d} points={len(branch)} "
+                    f"M4={current:.7f} step={step_size:.5g}")
+                last_progress = time.perf_counter()
+        return branch, "sweep slice budget reached"
+
+    started = time.perf_counter()
+    log("sweep_trace begin")
+    negative, negative_stop = sweep_branch(-1)
+    positive, positive_stop = sweep_branch(1)
+    points = list(reversed(negative)) + [center] + positive
+    timing["sweep_trace"] = time.perf_counter() - started
+    output["sweep_track"] = {
+        "success": len(points) > 1, "points": points,
+        "angles": np.array([point["angles4"] for point in points]),
+        "base_sweep_value": base_sweep, "sweep_actuator": sweep_actuator,
+        "negative_stop_reason": negative_stop, "positive_stop_reason": positive_stop,
+        "sweep_half_span_deg": sweep_half_span_deg, "sweep_step_deg": sweep_step_deg,
+        "sweep_refinement_levels": sweep_refinement_levels,
+        "sweep_expand_to_bounds": bool(sweep_expand_to_bounds),
+        "sweep_slice_records": sweep_records,
+        "coverage_limited": any("cap reached" in reason or "budget reached" in reason
+                                for reason in (negative_stop, positive_stop)),
+    }
+    log(f"sweep_trace done dt={timing['sweep_trace']:.3f}s points={len(points)}")
+    if len(points) < 2:
+        output["failure_reason"] = "Could not trace a usable centered M4-sweep track."
+        return output
+
+    started = time.perf_counter()
+    boundary_curves = []
+    for edge, point in zip(("low", "high"), (points[0], points[-1])):
+        log(f"corner_trace {edge} begin sweep={point['sweep_value']:.6f}")
+        curve = (center_line if abs(point["sweep_value"] - base_sweep) <= 1e-12
+                 else trace_line(unpack_variables(point["x"], *mirrors), center_start=False))
+        boundary_curves.append(curve)
+        if not curve.get("success") or not curve.get("points"):
+            output.update(failure_reason=f"Could not trace {edge} sweep corners: {curve.get('failure_reason')}",
+                          boundary_curves=boundary_curves)
+            timing["corner_trace"] = time.perf_counter() - started
+            return output
+        log(f"corner_trace {edge} done points={len(curve['points'])}")
+    timing["corner_trace"] = time.perf_counter() - started
+    low, high = boundary_curves
+    corner_points = [low["points"][0], low["points"][-1],
+                     high["points"][-1], high["points"][0]]
+    corner_fit = {}
+    if sweep_expand_to_bounds:
+        # The global M4 extrema may be single vertices, not short edges of a
+        # trapezoid. Add a few interior boundary lines before fitting a quad.
+        support_curves.extend(dict(curve, sweep_value=point["sweep_value"])
+                              for curve, point in zip(boundary_curves, (points[0], points[-1])))
+        for fraction in (0.25, 0.5, 0.75):
+            value = points[0]["sweep_value"] + fraction * (points[-1]["sweep_value"] - points[0]["sweep_value"])
+            point = min(points, key=lambda item: abs(item["sweep_value"] - value))
+            if any(abs(curve["sweep_value"] - point["sweep_value"]) < 1e-9 for curve in support_curves):
+                continue
+            curve = trace_line(unpack_variables(point["x"], *mirrors), center_start=False)
+            if curve.get("success") and curve.get("points"):
+                support_curves.append(dict(curve, sweep_value=point["sweep_value"]))
+        boundary_points = points + [point for curve in support_curves
+                                   for point in (curve["points"][0], curve["points"][-1])]
+        boundary_t0 = time.perf_counter()
+        log("boundary_refinement begin")
+        boundary_points, boundary_diagnostics = _refine_quadcell_surface_boundary(
+            mirrors, boundary_points, target_reflections, int(angle_axes4[sweep_index]), corrector_options,
+            sweep_bounds=(base_sweep - (max(3.0, 4 * sweep_half_span_deg) if sweep_max_half_span_deg is None
+                                       else abs(sweep_max_half_span_deg)),
+                          base_sweep + (max(3.0, 4 * sweep_half_span_deg) if sweep_max_half_span_deg is None
+                                       else abs(sweep_max_half_span_deg))),
+        )
+        timing["boundary_refinement"] = time.perf_counter() - boundary_t0
+        output["boundary_refinement"] = boundary_diagnostics
+        log(f"boundary_refinement done dt={timing['boundary_refinement']:.3f}s "
+            f"valid={sum(record['success'] for record in boundary_diagnostics)}/{len(boundary_diagnostics)}")
+        fit = _fit_quadcell_boundary_corners(boundary_points)
+        if fit is not None:
+            corner_points = fit["corner_points"]
+            corner_fit = {key: value for key, value in fit.items() if key != "corner_points"}
+        output["support_curves"] = support_curves
+    corners = np.array([np.asarray(point["x"])[angle_axes4] for point in corner_points])
+    line_limit_reached = any("step limit" in str(curve.get(key, ""))
+                             for curve in [center_line, *boundary_curves]
+                             for key in ("negative_stop_reason", "positive_stop_reason"))
+    output["sweep_track"]["coverage_limited"] |= line_limit_reached
+    output["sweep_track"]["line_limit_reached"] = line_limit_reached
+    if output["sweep_track"]["coverage_limited"]:
+        log("surface coverage limited by search cap or step/slice budget; bounds are not claimed as physical edges")
+    directions = (corners[1:] - corners[0]).T
+    if np.linalg.matrix_rank(directions, tol=1e-10) < 2:
+        output["failure_reason"] = "Corner bounds do not span a usable two-dimensional surface."
+        return output
+    recovered_sweep_bounds = (points[0]["sweep_value"], points[-1]["sweep_value"])
+    if corner_fit:
+        hull_angles = corner_fit["boundary_hull_angles4"]
+        recovered_sweep_bounds = (float(hull_angles[:, sweep_index].min()), float(hull_angles[:, sweep_index].max()))
+        output["sweep_track"]["boundary_refined_bounds"] = recovered_sweep_bounds
+        cap = max(3.0, 4 * sweep_half_span_deg) if sweep_max_half_span_deg is None else abs(sweep_max_half_span_deg)
+        output["sweep_track"]["sweep_max_half_span_deg"] = cap
+        output["sweep_track"]["coverage_limited"] |= any(
+            abs(value - base_sweep) >= cap - 1e-8 for value in recovered_sweep_bounds)
+    output.update(success=True, boundary_curves=boundary_curves, center_x=center_x,
+                  model={"method": ("bounded_plane_from_recovered_boundary" if corner_fit
+                                     else "bilinear_patch_from_traced_corners"), "corners4": corners,
+                         **corner_fit,
+                         "plane_corners": np.vstack((corners, corners[0])),
+                         "corner_points": corner_points, "target_reflections": int(target_reflections),
+                         "base_angles4": center_x[angle_axes4],
+                         "sweep_bounds": recovered_sweep_bounds,
+                         "parameter_bounds": ((0.0, 1.0), (0.0, 1.0))})
+    return output
+
+
+def _refine_surface_stage_target_match(
+        M1, M2, M3, M4, *, target_angles4, source_N_R, active_indices,
+        sweep_index, seeds, angle_bounds, qc_limit, u_min, u_max,
+        include_edge_ends=False, u_tolerance=1e-9):
+    """Try identical target active angles, then minimize their feasible mismatch."""
+    mirrors = (M1, M2, M3, M4)
+    start_x = pack_variables(*mirrors)
+    axes4 = np.array([1, 3, 5, 7])
+    start = start_x[axes4]
+    target = np.asarray(target_angles4, dtype=float)
+    active_indices = np.asarray(active_indices, dtype=int)
+    lower, upper = np.asarray(angle_bounds, dtype=float).T
+    expected_hits = int(source_N_R) if include_edge_ends else max(0, int(source_N_R) - 2)
+    cache = {}
+    optimizer_runs = []
+
+    def distance_squared(angles):
+        delta = (np.asarray(angles) - target)[active_indices]
+        return float(delta @ delta)
+
+    def evaluate(angles):
+        angles = np.asarray(angles, dtype=float)
+        key = tuple(angles)
+        if key not in cache:
+            x = start_x.copy()
+            x[axes4] = angles
+            count = int(get_reflection_count(*unpack_variables(x, *mirrors)))
+            record = {"x": x, "angles4": angles.copy(), "reflection_count": count,
+                      "distance_squared": distance_squared(angles), "valid": False,
+                      "constraints": np.full(4 + 2 * expected_hits, -1e3)}
+            if count == source_N_R:
+                qc = np.asarray(quadcell_errors_from_variables(x, *mirrors), dtype=float)
+                edge = reflection_edge_summary(x, *mirrors, include_ends=include_edge_ends)
+                hits = np.asarray(edge["u_values"], dtype=float)
+                if (hits.size == expected_hits and np.all(np.isfinite(hits))
+                        and np.all(np.isfinite(qc))):
+                    constraints = np.r_[qc_limit - qc, qc_limit + qc,
+                                        hits - u_min + u_tolerance, u_max - hits + u_tolerance]
+                    record.update(qc=qc, qc_max_abs=float(np.max(np.abs(qc))),
+                                  constraints=constraints, valid=bool(np.min(constraints) >= -1e-10))
+            cache[key] = record
+        return cache[key]
+
+    def direct_angles(value):
+        angles = target.copy()
+        angles[sweep_index] = float(np.asarray(value).ravel()[0])
+        return angles
+
+    # The centered cross need not describe the full feasible M4 interval at
+    # these particular active angles. Scan the configured source search span.
+    values = np.unique(np.r_[np.linspace(lower[sweep_index], upper[sweep_index], 257),
+                             [np.clip(np.asarray(seed)[sweep_index], lower[sweep_index], upper[sweep_index])
+                              for seed in seeds]])
+    direct = [evaluate(direct_angles(value)) for value in values]
+    on_branch = [record for record in direct if record["reflection_count"] == source_N_R
+                 and "qc" in record]
+    on_branch.sort(key=lambda record: (float(np.sum(np.minimum(record["constraints"], 0) ** 2)),
+                                       float(record["qc"] @ record["qc"])))
+
+    def direct_qc_objective(value):
+        qc = evaluate(direct_angles(value)).get("qc", np.full(2, 1e3))
+        return float(qc @ qc)
+
+    for record in on_branch[:4]:
+        result = minimize(
+            direct_qc_objective,
+            [record["angles4"][sweep_index]], method="SLSQP",
+            bounds=[(lower[sweep_index], upper[sweep_index])],
+            constraints={"type": "ineq", "fun": lambda value: evaluate(direct_angles(value))["constraints"]},
+            options={"maxiter": 40, "ftol": 1e-13, "eps": 1e-7},
+        )
+        evaluate(direct_angles(result.x))
+        optimizer_runs.append({"method": "fixed_active_angles", "success": bool(result.success),
+                               "message": str(result.message)})
+    exact = [record for record in cache.values() if record["valid"]
+             and record["distance_squared"] <= 1e-24]
+    if exact:
+        best = min(exact, key=lambda record: (record["qc_max_abs"],
+                                              float(np.linalg.norm(record["angles4"] - start))))
+        return [{"x": best["x"], "method": "exact_target_active_angles"}], {
+            "exact_active_match_found": True, "checked": len(cache), "optimizer_runs": optimizer_runs,
+            "best_active_distance": float(np.sqrt(best["distance_squared"])),
+        }
+
+    def gradient(angles):
+        jac = np.zeros(4)
+        jac[active_indices] = 2 * (np.asarray(angles) - target)[active_indices]
+        return jac
+
+    seed_records = [evaluate(np.asarray(seed)) for seed in seeds]
+    valid_seeds = sorted((record for record in seed_records if record["valid"]),
+                         key=lambda record: record["distance_squared"])
+    unique_seeds = []
+    for record in valid_seeds:
+        if all(np.linalg.norm(record["angles4"] - other["angles4"]) > 1e-6 for other in unique_seeds):
+            unique_seeds.append(record)
+        if len(unique_seeds) == 3:
+            break
+    for record in unique_seeds:
+        result = minimize(
+            distance_squared, record["angles4"], jac=gradient, method="SLSQP",
+            bounds=list(zip(lower, upper)),
+            constraints={"type": "ineq", "fun": lambda angles: evaluate(angles)["constraints"]},
+            options={"maxiter": 80, "ftol": 1e-14, "eps": 1e-7},
+        )
+        evaluate(result.x)
+        optimizer_runs.append({"method": "constrained_active_distance", "success": bool(result.success),
+                               "message": str(result.message)})
+    feasible = sorted((record for record in cache.values() if record["valid"]),
+                      key=lambda record: (record["distance_squared"], record["qc_max_abs"]))
+    candidates = []
+    for record in feasible:
+        if all(np.linalg.norm(record["x"] - candidate["x"]) > 1e-6 for candidate in candidates):
+            candidates.append({"x": record["x"], "method": "constrained_target_active_angles"})
+        if len(candidates) == 3:
+            break
+    return candidates, {
+        "exact_active_match_found": False, "checked": len(cache), "optimizer_runs": optimizer_runs,
+        "best_active_distance": float(np.sqrt(feasible[0]["distance_squared"])) if feasible else None,
+    }
+
+
+def _refine_surface_stage_sweep_match(
+        M1, M2, M3, M4, *, source_x, target_angles4, source_N_R, target_N_R,
+        active_indices, sweep_index, rejected_scan, angle_bounds, qc_limit,
+        qc_reacquire_limit, u_min, u_max, scan_samples, angle_scan_limit,
+        stop_mode, center_tolerance, include_edge_ends=False, u_tolerance=1e-9,
+        max_active_adjustment_deg=0.02):
+    """Repair a nearby staging match whose first target stop grazes a u bound.
+
+    Optimize the source and landing together, then require the ordinary first-
+    return scan to validate the result. A scan-step-sized landing margin avoids
+    accepting a continuous solution that fails at the next sampled stop.
+    """
+    base = (M1, M2, M3, M4)
+    axes4 = np.array([1, 3, 5, 7])
+    source_x = np.asarray(source_x, dtype=float)
+    initial = source_x[axes4]
+    target = np.asarray(target_angles4, dtype=float)
+    active_indices = np.asarray(active_indices, dtype=int)
+    sweep_axis = int(axes4[sweep_index])
+    records = [record for record in rejected_scan["directions"]
+               if record.get("rejected_stop", {}).get("N_R") == target_N_R]
+    diagnostics = {"attempted": bool(records), "optimizer_runs": [], "success": False}
+    candidates = []
+    scan_step = float(angle_scan_limit) / (max(3, int(scan_samples)) - 1)
+
+    for rejected in records:
+        stop = rejected["rejected_stop"]
+        landing = np.asarray(stop["x"], dtype=float)
+        initial_variables = np.r_[initial, landing[sweep_axis]]
+        qc_index = int(np.argmin(np.abs(stop["qc"])))
+        qc_goal = 0.0
+        if stop_mode == "window":
+            qc_index = int(np.argmax(np.abs(stop["qc"])))
+            qc_goal = float(np.sign(stop["qc"][qc_index]) * qc_reacquire_limit)
+
+        # Bound the sampling error using the local reflection-position slope.
+        edge = reflection_edge_summary(landing, *base, include_ends=include_edge_ends)
+        target_hits = np.asarray(edge["u_values"], dtype=float)
+        probe = landing.copy()
+        probe[sweep_axis] += min(1e-5, scan_step / 10)
+        probe_edge = reflection_edge_summary(probe, *base, include_ends=include_edge_ends)
+        probe_hits = np.asarray(probe_edge["u_values"], dtype=float)
+        margin = np.zeros_like(target_hits)
+        if probe_hits.shape == target_hits.shape and np.all(np.isfinite(probe_hits)):
+            margin = np.minimum(
+                np.abs(probe_hits - target_hits) / (probe[sweep_axis] - landing[sweep_axis]) * scan_step,
+                0.1 * (u_max - u_min),
+            )
+        margin = np.maximum(margin, 10 * u_tolerance)
+        lower, upper = np.asarray(angle_bounds, dtype=float).T.copy()
+        lower[active_indices] = np.maximum(
+            lower[active_indices], initial[active_indices] - max_active_adjustment_deg)
+        upper[active_indices] = np.minimum(
+            upper[active_indices], initial[active_indices] + max_active_adjustment_deg)
+        bounds = list(zip(lower, upper)) + [
+            (initial[sweep_index] - angle_scan_limit, initial[sweep_index] + angle_scan_limit)]
+        cache = {}
+
+        def evaluate(variables):
+            key = tuple(variables)
+            if key in cache:
+                return cache[key]
+            source = source_x.copy()
+            source[axes4] = variables[:4]
+            destination = source.copy()
+            destination[sweep_axis] = variables[4]
+            constraints = []
+            landing_qc = None
+            for x, count, limit, inset in (
+                (source, source_N_R, qc_limit, 0.0),
+                (destination, target_N_R, qc_reacquire_limit, margin),
+            ):
+                expected_hits = count if include_edge_ends else max(0, count - 2)
+                qc = np.asarray(quadcell_errors_from_variables(x, *base), dtype=float)
+                edge = reflection_edge_summary(x, *base, include_ends=include_edge_ends)
+                hits = np.asarray(edge["u_values"], dtype=float)
+                if (get_reflection_count(*unpack_variables(x, *base)) != count or
+                        hits.size != expected_hits or not np.all(np.isfinite(hits)) or
+                        not np.all(np.isfinite(qc))):
+                    constraints.extend(np.full(4 + 2 * expected_hits, -1e3))
+                    continue
+                constraints.extend(np.r_[limit - qc, limit + qc,
+                                         hits - u_min - inset + u_tolerance,
+                                         u_max - inset - hits + u_tolerance])
+                if count == target_N_R:
+                    landing_qc = qc
+            equality = 1e3 if landing_qc is None else float(landing_qc[qc_index] - qc_goal)
+            cache[key] = np.asarray(constraints), equality, source
+            return cache[key]
+
+        def objective(variables):
+            delta = (variables[:4] - target)[active_indices]
+            return 1e4 * float(delta @ delta + 1e-10 * np.sum((variables - initial_variables) ** 2))
+
+        def gradient(variables):
+            result = 2e-10 * (variables - initial_variables)
+            result[active_indices] += 2 * (variables[:4] - target)[active_indices]
+            return 1e4 * result
+
+        result = minimize(
+            objective, initial_variables, jac=gradient, method="SLSQP", bounds=bounds,
+            constraints=[{"type": "ineq", "fun": lambda value: evaluate(value)[0]},
+                         {"type": "eq", "fun": lambda value: evaluate(value)[1]}],
+            options={"maxiter": 80, "ftol": 1e-12, "eps": 1e-7},
+        )
+        constraints, equality, source = evaluate(result.x)
+        attempt = {"optimizer_success": bool(result.success), "message": str(result.message),
+                   "distance": float(np.linalg.norm((result.x[:4] - target)[active_indices])),
+                   "landing_u_sampling_margin_max": float(np.max(margin)) if margin.size else 0.0}
+        diagnostics["optimizer_runs"].append(attempt)
+        if np.min(constraints) < -1e-8 or abs(equality) > 1e-6:
+            continue
+        scan = scan_reflection_count_sweep_reacquisition(
+            *unpack_variables(source, *base), target_N_R,
+            sweep_actuator=["M1.dangle", "M2.dangle", "M3.dangle", "M4.dangle"][sweep_index],
+            qc_reacquire_limit=qc_reacquire_limit, angle_scan_limit=angle_scan_limit,
+            scan_samples=scan_samples, stop_mode=stop_mode, center_tolerance=center_tolerance,
+            u_min=u_min, u_max=u_max,
+        )
+        attempt.update(scan_success=bool(scan["success"]), failure_reason=scan["failure_reason"])
+        if scan["success"]:
+            candidates.append({"x": source, "method": "jump_constrained_active_match",
+                               "target_sweep_validation": scan})
+    diagnostics["success"] = bool(candidates)
+    return candidates, diagnostics
+
+
 def plan_reflection_count_surface_stage(
         M1, M2, M3, M4,
         target_N_R,
@@ -6467,9 +7750,13 @@ def plan_reflection_count_surface_stage(
         distance_metric="active_3d",
         stage_qc_tolerance=0.05,
         stage_path_qc_limit=2.0,
+        qc_reacquire_limit=3.0,
         sweep_half_span_deg=1.0,
         sweep_step_deg=0.05,
         sweep_refinement_levels=8,
+        sweep_expand_to_bounds=True,
+        sweep_max_half_span_deg=None,
+        sweep_min_step_deg=1e-4,
         preferred_axis=None,
         line_max_steps_per_side=400,
         line_step_deg=0.1,
@@ -6487,22 +7774,62 @@ def plan_reflection_count_surface_stage(
         center_final_qc_tolerance=0.5,
         center_enforce_final_u_bounds=True,
         center_final_u_tolerance=1e-9,
+        repair_source_out_of_bounds=True,
+        source_repair_n_tries=None,
+        source_repair_angle_perturb=None,
         jacobian_step_deg=1e-4,
         qc_scale=0.01,
         sigma_edge=0.02,
         correction_regularization=0.08,
         max_corrector_nfev=120,
         projection_refinement_samples=3,
+        max_stage_path_candidates=2,
+        execute_target_jump=True,
+        target_jump_include_active_residuals=True,
+        min_angle_step=1e-12,
         stage_max_axis_splits=80,
         stage_waypoint_depth=4,
         stage_motion_samples_per_step=15,
         stage_fast_motion_samples_per_step=5,
         include_edge_ends=False,
-        profile_callback=None):
-    """Find a same-N_R centered staging point nearest to a target-N_R solution.
+        profile_callback=None,
+        validate_target_sweep=True,
+        target_sweep_angle_scan_limit=1.0,
+        target_sweep_scan_samples=1001,
+        target_sweep_stop_mode="window",
+        target_sweep_center_tolerance=0.0,
+        center_retry_angle_scales=DEFAULT_CENTER_RETRY_ANGLE_SCALES,
+        match_target_active_angles=True):
+    """Trace corner-bounded source/target sheets and select a staging point.
 
-    The returned actuation plan intentionally stops at the same-reflection-count
-    staging point and requests an inverse refresh before the actual N_R jump.
+    First choose a validated point on the target sheet nearest the actual
+    starting angles, then project it onto the source sheet. Both sheets use
+    multi-seed M4 continuation, fixed-M4 boundary lines and sparse constrained
+    boundary-support solves. Four prominent corners summarize each sheet;
+    projection retains the wider sampled boundary when it is not a quadrilateral.
+    Fitted planes only propose points; exact correction, reflection count,
+    QC/u checks, sweep validation and constrained routing remain required.
+    With match_target_active_angles, first try the target's exact three active
+    angles with only the sweep angle free. Otherwise refine the active-angle
+    distance under the staging QC window, not the stricter surface-centering
+    tolerance. Coincident-looking 3D patches alone never authorize a move.
+
+    By default, the returned actuation plan first moves to the same-N_R staging
+    point, then appends a sweep-actuator target jump toward the solved target
+    base. Set execute_target_jump=False to stop at the staging point and request
+    an inverse refresh before the actual N_R jump. If the source starts outside
+    the requested reflection-u bounds, the planner can first move to a nearby
+    centered same-N_R state inside those bounds.
+    With validate_target_sweep, select only staging points whose first visible
+    sweep-actuator return reaches target_N_R, and plan that one-axis jump rather
+    than relying on corrections that would run after the reacquisition stop.
+    If the nearest active-angle match narrowly fails the landing u bounds,
+    refine source and landing together locally before trying distant samples.
+    profile_callback receives phase/distance messages and throttled inner
+    search progress. Once routing succeeds, strictly worse-distance candidates
+    are skipped; ties still use the original path-motion ranking.
+    Target centering and global source repair share the family's narrower
+    random-search retries; QC and reflection-u constraints remain unchanged.
     """
     M_start = (
         np.array(M1, dtype=float),
@@ -6512,6 +7839,7 @@ def plan_reflection_count_surface_stage(
     )
     x_start = pack_variables(*M_start)
     target_N_R = int(target_N_R)
+    center_retry_angle_scales = _normalize_center_retry_angle_scales(center_retry_angle_scales)
     distance_metric = str(distance_metric)
 
     angle_labels4 = ["M1.dangle", "M2.dangle", "M3.dangle", "M4.dangle"]
@@ -6545,6 +7873,7 @@ def plan_reflection_count_surface_stage(
 
     stage_qc_tolerance = float(abs(stage_qc_tolerance))
     stage_path_qc_limit = float(abs(stage_path_qc_limit))
+    qc_reacquire_limit = float(abs(qc_reacquire_limit))
     sweep_half_span_deg = float(abs(sweep_half_span_deg))
     sweep_step_deg = float(abs(sweep_step_deg))
     sweep_refinement_levels = max(0, int(sweep_refinement_levels))
@@ -6559,6 +7888,18 @@ def plan_reflection_count_surface_stage(
     if center_u_max is None:
         center_u_max = u_max
     projection_refinement_samples = max(1, int(projection_refinement_samples))
+    max_stage_path_candidates = max(1, int(max_stage_path_candidates))
+    execute_target_jump = bool(execute_target_jump)
+    target_jump_include_active_residuals = bool(target_jump_include_active_residuals)
+    repair_source_out_of_bounds = bool(repair_source_out_of_bounds)
+    if source_repair_n_tries is None:
+        source_repair_n_tries = center_n_tries
+    source_repair_n_tries = max(1, int(source_repair_n_tries))
+    if source_repair_angle_perturb is None:
+        source_repair_angle_perturb = center_angle_perturb
+    source_repair_angle_perturb = float(abs(source_repair_angle_perturb))
+    min_angle_step = float(abs(min_angle_step))
+    stage_only_refresh_mode = not execute_target_jump
     stage_max_axis_splits = max(1, int(stage_max_axis_splits))
     stage_waypoint_depth = max(0, int(stage_waypoint_depth))
     stage_motion_samples_per_step = max(1, int(stage_motion_samples_per_step))
@@ -6566,6 +7907,8 @@ def plan_reflection_count_surface_stage(
 
     planner_t0 = time.perf_counter()
     planner_timing = {}
+    target_center_search_attempts = []
+    surface_context = {}
 
     def profile_plan(message):
         if profile_callback is not None:
@@ -6586,6 +7929,10 @@ def plan_reflection_count_surface_stage(
 
     def mirrors_from_x(x):
         return unpack_variables(np.array(x, dtype=float), *M_start)
+
+    def angle_move_text(x_from, x_to):
+        delta = angles4_from_x(x_to) - angles4_from_x(x_from)
+        return ",".join(f"{label}={amount:+.6g}" for label, amount in zip(angle_labels4, delta))
 
     def point_payload_from_x(x, coordinate=0.0, sweep_value=None):
         x = np.array(x, dtype=float)
@@ -6617,14 +7964,24 @@ def plan_reflection_count_surface_stage(
             "steps": [],
             "n_steps": 0,
             "reflection_count_surface_stage": True,
-            "stage_only_refresh": True,
+            "staging_angle_targets": True,
+            "stage_only_refresh": bool(stage_only_refresh_mode),
             "reflection_count_change": True,
             "reflection_count_reacquisition": True,
             "rotation_only": True,
             "qc_path_unconstrained": False,
-            "reacquisition_strategy": "surface_stage_then_refresh",
-            "search_mode": "surface_stage_then_refresh",
+            "reacquisition_strategy": (
+                "surface_stage_then_refresh"
+                if stage_only_refresh_mode else
+                "surface_stage_then_jump"
+            ),
+            "search_mode": (
+                "surface_stage_then_refresh"
+                if stage_only_refresh_mode else
+                "surface_stage_then_jump"
+            ),
             "distance_metric": distance_metric,
+            "match_target_active_angles": bool(match_target_active_angles),
             "target_N_R": int(target_N_R),
             "start_reflections": int(source_N_R),
             "stage_reflections": int(source_N_R),
@@ -6632,13 +7989,20 @@ def plan_reflection_count_surface_stage(
             "target_N_R_reached": False,
             "stage_reached": False,
             "requires_inverse_refresh": False,
+            "qc_only_reacquire_stop": bool(execute_target_jump),
             "suggested_next_step": None,
             "stage_qc_tolerance": float(stage_qc_tolerance),
             "stage_path_qc_limit": float(stage_path_qc_limit),
+            "qc_reacquire_limit": float(qc_reacquire_limit),
             "u_min": float(u_min),
             "u_max": float(u_max),
             "accept_u_min": float(accept_u_min),
             "accept_u_max": float(accept_u_max),
+            "repair_source_out_of_bounds": bool(repair_source_out_of_bounds),
+            "source_repair_n_tries": int(source_repair_n_tries),
+            "source_repair_angle_perturb": float(source_repair_angle_perturb),
+            "center_retry_angle_scales": center_retry_angle_scales,
+            "target_center_search_attempts": list(target_center_search_attempts),
             "active_actuators": list(active_labels),
             "sweep_actuator": sweep_actuator,
             "angle_labels": list(angle_labels4),
@@ -6646,6 +8010,7 @@ def plan_reflection_count_surface_stage(
             "start_mirrors": M_start,
             "start_x": x_start.copy(),
             "failure_reason": failure_reason,
+            **surface_context,
         }
 
     def failure_result(failure_reason, **extra):
@@ -6659,6 +8024,10 @@ def plan_reflection_count_surface_stage(
         )
         return M_start, res, plan
 
+    profile_plan(
+        f"surface_stage start source_N_R={source_N_R} target_N_R={target_N_R} "
+        f"stage_qc_limit={stage_path_qc_limit:g} u_bounds=[{accept_u_min:g},{accept_u_max:g}]"
+    )
     start_diagnostics = actuation_constraint_diagnostics(
         x_start,
         *M_start,
@@ -6671,88 +8040,52 @@ def plan_reflection_count_surface_stage(
         include_edge_ends=include_edge_ends,
         constraint_tolerance=float(u_tolerance),
     )
+    source_seed_x = x_start.copy()
+    source_seed_mirrors = M_start
+    source_repair_steps = []
+    source_repair = {
+        "attempted": False,
+        "success": True,
+        "method": None,
+        "failure_reason": None,
+        "start_diagnostics": start_diagnostics,
+        "endpoint_diagnostics": start_diagnostics,
+        "path_plan": None,
+    }
+
     if not start_diagnostics["ok"]:
-        return failure_result(
-            "Current source configuration is outside staging constraints: " +
-            "; ".join(start_diagnostics["failures"]),
-            start_diagnostics=start_diagnostics,
-        )
-
-    target_t0 = time.perf_counter()
-    try:
-        target_mirrors, target_center_res = center_quadcells(
+        start_without_edge_bounds = actuation_constraint_diagnostics(
+            x_start,
             *M_start,
-            N_R=target_N_R,
-            n_tries=center_n_tries,
-            angle_perturb=center_angle_perturb,
-            seed=center_seed,
-            u_min=center_u_min,
-            u_max=center_u_max,
-            sigma_edge=center_sigma_edge,
-            final_qc_tolerance=center_final_qc_tolerance,
-            enforce_final_u_bounds=center_enforce_final_u_bounds,
-            final_u_tolerance=center_final_u_tolerance,
-            final_u_min=accept_u_min,
-            final_u_max=accept_u_max,
+            max_qc_error=stage_path_qc_limit,
+            max_qc_difference=None,
+            expected_reflections=source_N_R,
+            u_min=accept_u_min,
+            u_max=accept_u_max,
+            enforce_edge_bounds=False,
+            include_edge_ends=include_edge_ends,
+            constraint_tolerance=float(u_tolerance),
         )
-    except Exception as exc:
-        add_timing("target_solve", time.perf_counter() - target_t0)
-        return failure_result(
-            "Could not solve target_N_R base configuration: " + str(exc),
-            target_center_exception=exc,
-        )
-    add_timing("target_solve", time.perf_counter() - target_t0)
-    target_x = pack_variables(*target_mirrors)
-    target_angles4 = angles4_from_x(target_x)
+        if not start_without_edge_bounds["ok"] or not repair_source_out_of_bounds:
+            return failure_result(
+                "Current source configuration is outside staging constraints: " +
+                "; ".join(start_diagnostics["failures"]),
+                start_diagnostics=start_diagnostics,
+                source_repair=source_repair,
+            )
 
-    line_t0 = time.perf_counter()
-    source_line_curve = trace_full_centered_quadcell_angle_curve(
-        *M_start,
-        target_reflections=source_N_R,
-        start_angles=x_start[active_axes],
-        active_actuators=active_labels,
-        preferred_axis=preferred_axis,
-        max_steps_per_side=line_max_steps_per_side,
-        step_deg=line_step_deg,
-        qc_tolerance=stage_qc_tolerance,
-        u_min=u_min,
-        u_max=u_max,
-        u_tolerance=u_tolerance,
-        accept_u_min=accept_u_min,
-        accept_u_max=accept_u_max,
-        jacobian_step_deg=jacobian_step_deg,
-        qc_scale=qc_scale,
-        sigma_edge=sigma_edge,
-        correction_regularization=correction_regularization,
-        max_corrector_nfev=max_corrector_nfev,
-        include_edge_ends=include_edge_ends,
-    )
-    add_timing("source_line_trace", time.perf_counter() - line_t0)
-    if not source_line_curve.get("success") or len(source_line_curve.get("points", [])) == 0:
-        return failure_result(
-            "Could not trace source centered line: " +
-            str(source_line_curve.get("failure_reason")),
-            target_base_mirrors=target_mirrors,
-            target_base_x=target_x,
-            target_center_result=target_center_res,
-            source_line_curve=source_line_curve,
-        )
+        source_repair["attempted"] = True
+        repair_t0 = time.perf_counter()
+        repair_candidates = []
+        repair_failures = []
+        all_angle_labels = list(angle_labels4)
+        start_angles4 = angles4_from_x(x_start)
 
-    line_points = list(source_line_curve["points"])
-    line_coordinates = np.array(source_line_curve.get("coordinates", []), dtype=float)
-    line_start_index = int(np.argmin(np.abs(line_coordinates))) if line_coordinates.size else 0
-    source_center_point = line_points[line_start_index]
-    source_center_x = np.array(source_center_point["x"], dtype=float)
-    source_center_angles4 = angles4_from_x(source_center_x)
-    base_sweep_value = float(source_center_angles4[sweep_angle4_index])
-
-    def correct_sweep_point(sweep_value, active_guess, coordinate):
-        slice_mirrors = _mirrors_with_dangle_value(M_start, sweep_actuator, sweep_value)
-        correction = correct_centered_quadcell_angles(
-            *slice_mirrors,
-            theta_pred=np.array(active_guess, dtype=float),
+        local_repair = correct_centered_quadcell_angles(
+            *M_start,
+            theta_pred=start_angles4,
             target_reflections=source_N_R,
-            active_actuators=active_labels,
+            active_actuators=all_angle_labels,
             qc_tolerance=stage_qc_tolerance,
             u_min=u_min,
             u_max=u_max,
@@ -6766,242 +8099,393 @@ def plan_reflection_count_surface_stage(
             max_corrector_nfev=max_corrector_nfev,
             include_edge_ends=include_edge_ends,
         )
+        source_repair["local_correction"] = local_repair
+        if local_repair["success"]:
+            repair_candidates.append((
+                "local_four_angle_correction",
+                np.array(local_repair["payload"]["x"], dtype=float),
+                local_repair,
+            ))
+        else:
+            repair_failures.append(
+                "local correction: " + str(local_repair.get("failure_reason"))
+            )
+
+        def route_source_repair(candidate_x):
+            candidate_steps = []
+            routed_x, path_plan = append_waypoint_constrained_path_steps(
+                candidate_steps,
+                x_start,
+                candidate_x,
+                *M_start,
+                max_axis_splits=stage_max_axis_splits,
+                max_waypoint_depth=stage_waypoint_depth,
+                max_qc_error=stage_path_qc_limit,
+                max_qc_difference=None,
+                preserve_reflection_count=True,
+                motion_samples_per_step=stage_motion_samples_per_step,
+                fast_motion_samples_per_step=stage_fast_motion_samples_per_step,
+                u_min=accept_u_min,
+                u_max=accept_u_max,
+                # The source is already outside the desired margin. During
+                # recovery, preserve N_R and QC visibility; enforce u at the
+                # repaired endpoint and in all subsequent staging motion.
+                enforce_edge_bounds=False,
+                include_edge_ends=include_edge_ends,
+                constraint_tolerance=float(u_tolerance),
+                profile_callback=(lambda message: profile_plan("source repair " + message)),
+            )
+            reached = bool(np.linalg.norm(
+                np.array(routed_x, dtype=float) - np.array(candidate_x, dtype=float)
+            ) <= 1e-8)
+            return candidate_steps, path_plan, reached
+
+        selected_repair = None
+        for method, candidate_x, solve_result in repair_candidates:
+            endpoint_diagnostics = actuation_constraint_diagnostics(
+                candidate_x,
+                *M_start,
+                max_qc_error=stage_qc_tolerance,
+                max_qc_difference=None,
+                expected_reflections=source_N_R,
+                u_min=accept_u_min,
+                u_max=accept_u_max,
+                enforce_edge_bounds=True,
+                include_edge_ends=include_edge_ends,
+                constraint_tolerance=float(u_tolerance),
+            )
+            if not endpoint_diagnostics["ok"]:
+                repair_failures.append(
+                    f"{method} endpoint: " + "; ".join(endpoint_diagnostics["failures"])
+                )
+                continue
+            candidate_steps, path_plan, reached = route_source_repair(candidate_x)
+            if path_plan.get("failure_reason") is not None or not reached:
+                repair_failures.append(
+                    f"{method} path: " + str(path_plan.get(
+                        "failure_reason", "repair path did not reach its endpoint"
+                    ))
+                )
+                continue
+            selected_repair = (
+                method, candidate_x, solve_result, endpoint_diagnostics,
+                candidate_steps, path_plan,
+            )
+            break
+
+        if selected_repair is None:
+            try:
+                global_repair_mirrors, global_repair_result = _center_quadcells_with_retries(
+                    *M_start,
+                    N_R=source_N_R,
+                    n_tries=source_repair_n_tries,
+                    angle_perturb=source_repair_angle_perturb,
+                    center_retry_angle_scales=center_retry_angle_scales,
+                    seed=center_seed,
+                    u_min=u_min,
+                    u_max=u_max,
+                    sigma_edge=center_sigma_edge,
+                    final_qc_tolerance=stage_qc_tolerance,
+                    enforce_final_u_bounds=True,
+                    final_u_tolerance=center_final_u_tolerance,
+                    final_u_min=accept_u_min,
+                    final_u_max=accept_u_max,
+                    profile_callback=(lambda message: profile_plan("source repair " + message)),
+                )
+                candidate_x = pack_variables(*global_repair_mirrors)
+                endpoint_diagnostics = actuation_constraint_diagnostics(
+                    candidate_x,
+                    *M_start,
+                    max_qc_error=stage_qc_tolerance,
+                    max_qc_difference=None,
+                    expected_reflections=source_N_R,
+                    u_min=accept_u_min,
+                    u_max=accept_u_max,
+                    enforce_edge_bounds=True,
+                    include_edge_ends=include_edge_ends,
+                    constraint_tolerance=float(u_tolerance),
+                )
+                candidate_steps, path_plan, reached = route_source_repair(candidate_x)
+                if endpoint_diagnostics["ok"] and path_plan.get("failure_reason") is None and reached:
+                    selected_repair = (
+                        "center_quadcells_fallback",
+                        candidate_x,
+                        global_repair_result,
+                        endpoint_diagnostics,
+                        candidate_steps,
+                        path_plan,
+                    )
+                else:
+                    reasons = list(endpoint_diagnostics["failures"])
+                    if path_plan.get("failure_reason") is not None:
+                        reasons.append(str(path_plan["failure_reason"]))
+                    if not reached:
+                        reasons.append("repair path did not reach its endpoint")
+                    repair_failures.append(
+                        "center_quadcells fallback: " + "; ".join(reasons)
+                    )
+            except Exception as exc:
+                source_repair["global_exception"] = exc
+                repair_failures.append("center_quadcells fallback: " + str(exc))
+
+        add_timing("source_repair", time.perf_counter() - repair_t0)
+        if selected_repair is None:
+            source_repair.update({
+                "success": False,
+                "failure_reason": "; ".join(repair_failures),
+                "attempt_failures": repair_failures,
+            })
+            return failure_result(
+                "Could not recover the current source configuration inside staging "
+                f"reflection-u bounds [{accept_u_min}, {accept_u_max}]: " +
+                source_repair["failure_reason"],
+                start_diagnostics=start_diagnostics,
+                source_repair=source_repair,
+            )
+
+        (repair_method, source_seed_x, repair_solve_result,
+         repair_endpoint_diagnostics, source_repair_steps,
+         source_repair_path_plan) = selected_repair
+        source_seed_x = np.array(source_seed_x, dtype=float)
+        source_seed_mirrors = unpack_variables(source_seed_x, *M_start)
+        source_repair.update({
+            "success": True,
+            "method": repair_method,
+            "failure_reason": None,
+            "solve_result": repair_solve_result,
+            "endpoint_x": source_seed_x.copy(),
+            "endpoint_mirrors": source_seed_mirrors,
+            "endpoint_diagnostics": repair_endpoint_diagnostics,
+            "path_plan": source_repair_path_plan,
+            "steps": source_repair_steps,
+            "n_steps": len(source_repair_steps),
+            "attempt_failures": repair_failures,
+        })
+        profile_plan(
+            f"surface_stage source_repair method={repair_method} "
+            f"steps={len(source_repair_steps)} "
+            f"u=[{repair_endpoint_diagnostics['min_u']:.4g},"
+            f"{repair_endpoint_diagnostics['max_u']:.4g}]"
+        )
+
+    target_t0 = time.perf_counter()
+    profile_plan(f"surface_stage target_solve begin center_n_tries={center_n_tries} angle_perturb={center_angle_perturb:g}deg")
+    try:
+        target_mirrors, target_center_res = _center_quadcells_with_retries(
+            *source_seed_mirrors,
+            N_R=target_N_R,
+            n_tries=center_n_tries,
+            angle_perturb=center_angle_perturb,
+            center_retry_angle_scales=center_retry_angle_scales,
+            seed=center_seed,
+            u_min=center_u_min,
+            u_max=center_u_max,
+            sigma_edge=center_sigma_edge,
+            final_qc_tolerance=center_final_qc_tolerance,
+            enforce_final_u_bounds=center_enforce_final_u_bounds,
+            final_u_tolerance=center_final_u_tolerance,
+            final_u_min=accept_u_min,
+            final_u_max=accept_u_max,
+            profile_callback=profile_callback,
+        )
+        target_center_search_attempts = target_center_res.center_search_attempts
+    except Exception as exc:
+        target_center_search_attempts = getattr(exc, "center_search_attempts", [])
+        add_timing("target_solve", time.perf_counter() - target_t0)
+        return failure_result(
+            "Could not solve target_N_R base configuration: " + str(exc),
+            target_center_exception=exc,
+        )
+    add_timing("target_solve", time.perf_counter() - target_t0)
+    target_x = pack_variables(*target_mirrors)
+    target_angles4 = angles4_from_x(target_x)
+    profile_plan(
+        f"surface_stage target_solve done dt={planner_timing['target_solve']:.3f}s "
+        f"target_distance_from_start_4d_deg={np.linalg.norm(target_angles4 - angles4_from_x(x_start)):.6g} "
+        f"target_total_abs_angle_change_deg={np.sum(np.abs(target_angles4 - angles4_from_x(x_start))):.6g} "
+        f"delta_deg=({angle_move_text(x_start, target_x)})"
+    )
+
+    corrector_options = {
+        "qc_tolerance": stage_qc_tolerance, "u_min": u_min, "u_max": u_max,
+        "u_tolerance": u_tolerance, "accept_u_min": accept_u_min, "accept_u_max": accept_u_max,
+        "jacobian_step_deg": jacobian_step_deg, "qc_scale": qc_scale, "sigma_edge": sigma_edge,
+        "correction_regularization": correction_regularization,
+        "max_corrector_nfev": max_corrector_nfev, "include_edge_ends": include_edge_ends,
+    }
+
+    def trace_corner_surface(mirrors, count, name):
+        surface = _trace_centered_quadcell_corner_surface(
+            *mirrors, target_reflections=count, active_actuators=active_labels,
+            sweep_actuator=sweep_actuator, preferred_axis=preferred_axis,
+            line_max_steps_per_side=line_max_steps_per_side, line_step_deg=line_step_deg,
+            sweep_half_span_deg=sweep_half_span_deg, sweep_step_deg=sweep_step_deg,
+            sweep_refinement_levels=sweep_refinement_levels,
+            sweep_expand_to_bounds=sweep_expand_to_bounds,
+            sweep_max_half_span_deg=sweep_max_half_span_deg,
+            sweep_min_step_deg=sweep_min_step_deg,
+            profile_callback=lambda message: profile_plan(f"surface_stage {name}_" + message),
+            **corrector_options,
+        )
+        for phase, elapsed in surface["planner_timing"].items():
+            add_timing(f"{name}_{phase}", elapsed)
+        track = surface.get("sweep_track")
+        if track is not None:
+            track.update(angle_labels=list(angle_labels4), active_actuators=list(active_labels))
+        return surface
+
+    source_surface = trace_corner_surface(source_seed_mirrors, source_N_R, "source")
+    if not source_surface["success"]:
+        return failure_result(
+            "Could not trace source corner surface: " + source_surface["failure_reason"],
+            target_base_mirrors=target_mirrors, target_base_x=target_x,
+            source_line_curve=source_surface.get("line_curve"),
+            source_sweep_track=source_surface.get("sweep_track"),
+        )
+    source_line_curve = source_surface["line_curve"]
+    source_sweep_track = source_surface["sweep_track"]
+    source_center_x = np.array(source_surface["center_x"], dtype=float)
+    source_center_angles4 = angles4_from_x(source_center_x)
+    source_surface_model = source_surface["model"]
+    source_sweep_points = source_sweep_track["points"]
+    base_sweep_value = source_sweep_track["base_sweep_value"]
+    line_points = source_line_curve["points"]
+    surface_context.update(
+        source_surface_model=source_surface_model, source_line_curve=source_line_curve,
+        source_sweep_track=source_sweep_track, source_boundary_curves=source_surface["boundary_curves"],
+        target_base_mirrors=target_mirrors, target_base_x=target_x,
+        target_base_angles4=target_angles4.copy(), target_center_result=target_center_res,
+    )
+
+    target_surface = trace_corner_surface(target_mirrors, target_N_R, "target")
+    if not target_surface["success"]:
+        return failure_result(
+            "Could not trace target corner surface: " + target_surface["failure_reason"],
+            target_line_curve=target_surface.get("line_curve"),
+            target_sweep_track=target_surface.get("sweep_track"),
+        )
+    target_surface_model = target_surface["model"]
+    for model in (source_surface_model, target_surface_model):
+        model.update(angle_labels=list(angle_labels4), active_actuators=list(active_labels),
+                     sweep_actuator=sweep_actuator, distance_metric=distance_metric)
+    surface_context.update(
+        target_surface_model=target_surface_model, target_line_curve=target_surface["line_curve"],
+        target_sweep_track=target_surface["sweep_track"],
+        target_boundary_curves=target_surface["boundary_curves"],
+    )
+
+    def correct_surface_point(predicted_angles4, count, coordinate=0.0):
+        sweep_value = float(predicted_angles4[sweep_angle4_index])
+        correction = correct_centered_quadcell_angles(
+            *_mirrors_with_dangle_value(M_start, sweep_actuator, sweep_value),
+            theta_pred=np.array(predicted_angles4[active_angle4_indices], dtype=float),
+            target_reflections=count, active_actuators=active_labels, **corrector_options,
+        )
         if not correction["success"]:
             return None, correction
         payload = dict(correction["payload"])
-        payload["coordinate"] = float(coordinate)
-        payload["sweep_actuator"] = sweep_actuator
-        payload["sweep_value"] = float(sweep_value)
-        payload["angles4"] = angles4_from_x(payload["x"])
+        payload.update(coordinate=float(coordinate), sweep_actuator=sweep_actuator,
+                       sweep_value=sweep_value, angles4=angles4_from_x(payload["x"]))
         return payload, correction
 
-    def trace_sweep_branch(sign):
-        if sweep_half_span_deg <= 0 or sweep_step_deg <= 0:
-            return [], "zero sweep span"
-        branch = []
-        current_sweep = base_sweep_value
-        current_active = np.array(source_center_x[active_axes], dtype=float)
-        stop_reason = None
-        n_steps = max(1, int(np.ceil(sweep_half_span_deg / sweep_step_deg)))
-        for _ in range(n_steps):
-            remaining = sweep_half_span_deg - abs(current_sweep - base_sweep_value)
-            if remaining <= 1e-12:
-                stop_reason = "sweep half-span reached"
-                break
-            delta = min(float(sweep_step_deg), float(remaining))
-            trial_sweep = current_sweep + float(sign) * delta
-            payload, correction = correct_sweep_point(
-                trial_sweep,
-                current_active,
-                trial_sweep - base_sweep_value,
-            )
-            if payload is not None:
-                branch.append(payload)
-                current_sweep = float(trial_sweep)
-                current_active = np.array(payload["angles"], dtype=float)
-                continue
-
-            stop_reason = correction["failure_reason"]
-            low_sweep = float(current_sweep)
-            low_active = current_active.copy()
-            high_sweep = float(trial_sweep)
-            best_payload = None
-            for _ in range(sweep_refinement_levels):
-                midpoint = 0.5 * (low_sweep + high_sweep)
-                if abs(midpoint - low_sweep) <= 1e-12:
-                    break
-                refined_payload, refined_correction = correct_sweep_point(
-                    midpoint,
-                    low_active,
-                    midpoint - base_sweep_value,
-                )
-                if refined_payload is not None:
-                    best_payload = refined_payload
-                    low_sweep = float(midpoint)
-                    low_active = np.array(refined_payload["angles"], dtype=float)
-                else:
-                    high_sweep = float(midpoint)
-                    stop_reason = refined_correction["failure_reason"]
-            if best_payload is not None:
-                branch.append(best_payload)
-            break
-        else:
-            stop_reason = "sweep step limit reached"
-        return branch, stop_reason
-
-    sweep_t0 = time.perf_counter()
-    negative_sweep_points, negative_sweep_stop = trace_sweep_branch(-1.0)
-    positive_sweep_points, positive_sweep_stop = trace_sweep_branch(1.0)
-    source_sweep_points = (
-        list(reversed(negative_sweep_points)) +
-        [point_payload_from_x(source_center_x, coordinate=0.0, sweep_value=base_sweep_value)] +
-        positive_sweep_points
-    )
-    add_timing("source_sweep_trace", time.perf_counter() - sweep_t0)
-    if len(source_sweep_points) < 2:
-        return failure_result(
-            "Could not trace a usable source M4-sweep track.",
-            target_base_mirrors=target_mirrors,
-            target_base_x=target_x,
-            target_center_result=target_center_res,
-            source_line_curve=source_line_curve,
-            source_sweep_track={
-                "points": source_sweep_points,
-                "negative_stop_reason": negative_sweep_stop,
-                "positive_stop_reason": positive_sweep_stop,
-            },
-        )
-
-    line_angles = np.array([point_angles4(point) for point in line_points], dtype=float)
-    sweep_angles = np.array([point_angles4(point) for point in source_sweep_points], dtype=float)
-    line_low = line_angles[0]
-    line_high = line_angles[-1]
-    sweep_low = sweep_angles[0]
-    sweep_high = sweep_angles[-1]
-    line_vector = line_high - line_low
-    sweep_vector = sweep_high - sweep_low
-    line_norm = float(np.linalg.norm(line_vector))
-    sweep_norm = float(np.linalg.norm(sweep_vector))
-    if line_norm <= 1e-12:
-        return failure_result(
-            "Source fixed-sweep line has zero usable length.",
-            target_base_mirrors=target_mirrors,
-            target_base_x=target_x,
-            target_center_result=target_center_res,
-            source_line_curve=source_line_curve,
-            source_sweep_track={"points": source_sweep_points},
-        )
-    if sweep_norm <= 1e-12:
-        return failure_result(
-            "Source sweep track has zero usable length.",
-            target_base_mirrors=target_mirrors,
-            target_base_x=target_x,
-            target_center_result=target_center_res,
-            source_line_curve=source_line_curve,
-            source_sweep_track={"points": source_sweep_points},
-        )
-    line_unit = line_vector / line_norm
-    sweep_unit = sweep_vector / sweep_norm
-    basis = np.column_stack([line_unit, sweep_unit])
-    if np.linalg.matrix_rank(basis, tol=1e-10) < 2:
-        return failure_result(
-            "Source line and sweep directions are not independent enough to form a plane.",
-            target_base_mirrors=target_mirrors,
-            target_base_x=target_x,
-            target_center_result=target_center_res,
-            source_line_curve=source_line_curve,
-            source_sweep_track={"points": source_sweep_points},
-        )
-
-    line_projection_values = (line_angles - source_center_angles4) @ line_unit
-    sweep_projection_values = (sweep_angles - source_center_angles4) @ sweep_unit
-    line_bounds = (
-        float(np.min(line_projection_values)),
-        float(np.max(line_projection_values)),
-    )
-    sweep_bounds = (
-        float(np.min(sweep_projection_values)),
-        float(np.max(sweep_projection_values)),
-    )
-
-    projection_t0 = time.perf_counter()
-
-    def plane_angles(coefficients):
-        coefficients = np.array(coefficients, dtype=float)
-        return source_center_angles4 + basis @ coefficients
+    def correct_sweep_point(sweep_value, active_guess, coordinate):
+        predicted = source_center_angles4.copy()
+        predicted[active_angle4_indices] = active_guess
+        predicted[sweep_angle4_index] = sweep_value
+        return correct_surface_point(predicted, source_N_R, coordinate)
 
     def metric_delta(angles_a, angles_b):
-        angles_a = np.array(angles_a, dtype=float)
-        angles_b = np.array(angles_b, dtype=float)
-        return angles_a[metric_angle4_indices] - angles_b[metric_angle4_indices]
+        return (np.asarray(angles_a) - np.asarray(angles_b))[metric_angle4_indices]
 
     def metric_distance(angles_a, angles_b):
         return float(np.linalg.norm(metric_delta(angles_a, angles_b)))
 
-    def projection_objective(coefficients):
-        delta = metric_delta(plane_angles(coefficients), target_angles4)
-        return float(np.dot(delta, delta))
+    # Select a target near the actual starting state before projecting onto
+    # the source sheet. The target base diamond is only a seed for this search.
+    projection_t0 = time.perf_counter()
+    target_base_angles4 = target_angles4.copy()
+    target_coefficients, target_projection_res = _project_quadcell_corner_surface(
+        target_surface_model, angles4_from_x(x_start), metric_angle4_indices,
+    )
+    target_candidates = []
+    for coefficients in _quadcell_corner_surface_candidates(
+            target_coefficients, projection_refinement_samples, model=target_surface_model):
+        predicted = _quadcell_corner_surface_angles(target_surface_model, coefficients)
+        payload, correction = correct_surface_point(predicted, target_N_R)
+        record = {"coefficients": coefficients, "success": payload is not None,
+                  "failure_reason": None if payload is not None else correction["failure_reason"]}
+        if payload is not None:
+            angles = angles4_from_x(payload["x"])
+            record.update(payload=payload, angles4=angles,
+                          distance_from_start=metric_distance(angles, angles4_from_x(x_start)),
+                          full4d_distance_from_start=float(np.linalg.norm(angles - angles4_from_x(x_start))))
+        target_candidates.append(record)
+    usable_targets = [record for record in target_candidates if record["success"]]
+    add_timing("target_surface_projection", time.perf_counter() - projection_t0)
+    if not usable_targets:
+        return failure_result("No projected target-surface point passes exact centering/N_R/u checks.",
+                              target_projection_candidates=target_candidates)
+    selected_target = min(usable_targets, key=lambda record: (
+        record["distance_from_start"], record["full4d_distance_from_start"],
+        float(record["payload"]["qc_max_abs"]),
+    ))
+    selected_target_x = np.asarray(selected_target["payload"]["x"], dtype=float)
+    target_angles4 = angles4_from_x(selected_target_x)
+    surface_context.update(
+        selected_target_x=selected_target_x, selected_target_angles4=target_angles4,
+        selected_target_mirrors=mirrors_from_x(selected_target_x),
+        target_projection_candidates=target_candidates, selected_target_candidate=selected_target,
+        target_distance_from_start=float(selected_target["distance_from_start"]),
+        surface_selection_order="target_nearest_start_then_source_nearest_target",
+    )
+    target_surface_model.update(projected_coefficients=target_coefficients,
+                                selected_coefficients=selected_target["coefficients"],
+                                selected_angles4=target_angles4,
+                                projection_success=bool(target_projection_res.success),
+                                projection_message=str(target_projection_res.message))
+    profile_plan(
+        f"surface_stage target_surface_projection selected distance_from_start_deg="
+        f"{selected_target['distance_from_start']:.6g} "
+        f"base_distance_from_start_deg={metric_distance(target_base_angles4, angles4_from_x(x_start)):.6g}"
+    )
 
-    metric_basis = basis[metric_angle4_indices, :]
-    metric_target_delta = (
-        target_angles4[metric_angle4_indices] -
-        source_center_angles4[metric_angle4_indices]
+    projection_t0 = time.perf_counter()
+    projected_coefficients, projection_res = _project_quadcell_corner_surface(
+        source_surface_model, target_angles4, metric_angle4_indices,
     )
-    raw_coefficients, *_ = np.linalg.lstsq(
-        metric_basis,
-        metric_target_delta,
-        rcond=None,
+    source_start_coefficients, _ = _project_quadcell_corner_surface(
+        source_surface_model, angles4_from_x(source_seed_x), metric_angle4_indices,
     )
-    initial_coefficients = np.array([
-        np.clip(raw_coefficients[0], line_bounds[0], line_bounds[1]),
-        np.clip(raw_coefficients[1], sweep_bounds[0], sweep_bounds[1]),
-    ], dtype=float)
-    projection_res = minimize(
-        projection_objective,
-        initial_coefficients,
-        method="L-BFGS-B",
-        bounds=[line_bounds, sweep_bounds],
-    )
-    projected_coefficients = (
-        np.array(projection_res.x, dtype=float)
-        if projection_res.success else initial_coefficients
-    )
+
+    def plane_angles(coefficients):
+        return _quadcell_corner_surface_angles(source_surface_model, coefficients)
+
     add_timing("projection", time.perf_counter() - projection_t0)
 
     def candidate_coefficients():
-        candidates = [
-            projected_coefficients,
-            np.array([0.0, 0.0], dtype=float),
-            np.array([line_bounds[0], sweep_bounds[0]], dtype=float),
-            np.array([line_bounds[0], sweep_bounds[1]], dtype=float),
-            np.array([line_bounds[1], sweep_bounds[0]], dtype=float),
-            np.array([line_bounds[1], sweep_bounds[1]], dtype=float),
-            np.array([line_bounds[0], projected_coefficients[1]], dtype=float),
-            np.array([line_bounds[1], projected_coefficients[1]], dtype=float),
-            np.array([projected_coefficients[0], sweep_bounds[0]], dtype=float),
-            np.array([projected_coefficients[0], sweep_bounds[1]], dtype=float),
-        ]
-        if projection_refinement_samples > 1:
-            line_width = max(0.0, line_bounds[1] - line_bounds[0])
-            sweep_width = max(0.0, sweep_bounds[1] - sweep_bounds[0])
-            local_line_span = 0.15 * line_width
-            local_sweep_span = 0.15 * sweep_width
-            line_values = np.linspace(
-                max(line_bounds[0], projected_coefficients[0] - local_line_span),
-                min(line_bounds[1], projected_coefficients[0] + local_line_span),
-                projection_refinement_samples,
-                dtype=float,
-            )
-            sweep_values = np.linspace(
-                max(sweep_bounds[0], projected_coefficients[1] - local_sweep_span),
-                min(sweep_bounds[1], projected_coefficients[1] + local_sweep_span),
-                projection_refinement_samples,
-                dtype=float,
-            )
-            for line_value in line_values:
-                for sweep_value in sweep_values:
-                    candidates.append(np.array([line_value, sweep_value], dtype=float))
+        return _quadcell_corner_surface_candidates(
+            projected_coefficients, projection_refinement_samples, extra=(source_start_coefficients,),
+            model=source_surface_model,
+        )
 
-        deduped = []
-        seen = set()
-        for candidate in candidates:
-            candidate = np.array([
-                np.clip(candidate[0], line_bounds[0], line_bounds[1]),
-                np.clip(candidate[1], sweep_bounds[0], sweep_bounds[1]),
-            ], dtype=float)
-            key = tuple(np.round(candidate, 12))
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(candidate)
-        return deduped
-
-    sweep_value_min = float(np.min([point["sweep_value"] for point in source_sweep_points]))
-    sweep_value_max = float(np.max([point["sweep_value"] for point in source_sweep_points]))
+    sweep_value_min, sweep_value_max = source_surface_model["sweep_bounds"]
     start_angles4 = angles4_from_x(x_start)
+    source_seed_angles4 = angles4_from_x(source_seed_x)
     candidate_records = []
     validation_t0 = time.perf_counter()
-    for coefficients in candidate_coefficients():
+    path_validation_t0 = None
+    coefficients_to_check = candidate_coefficients()
+    last_projection_progress_t = validation_t0
+    profile_plan(f"surface_stage projection_candidates begin candidates={len(coefficients_to_check)}")
+    for candidate_index, coefficients in enumerate(coefficients_to_check, start=1):
+        if profile_callback is not None:
+            now = time.perf_counter()
+            if now - last_projection_progress_t >= 5.0:
+                profile_plan(
+                    f"surface_stage projection_candidates in_progress checked={candidate_index - 1}/{len(coefficients_to_check)} "
+                    f"elapsed={now - validation_t0:.1f}s"
+                )
+                last_projection_progress_t = now
         predicted_angles4 = plane_angles(coefficients)
         sweep_value = float(np.clip(
             predicted_angles4[sweep_angle4_index],
@@ -7009,13 +8493,21 @@ def plan_reflection_count_surface_stage(
             sweep_value_max,
         ))
         predicted_angles4[sweep_angle4_index] = sweep_value
-        payload, correction = correct_sweep_point(
-            sweep_value,
-            predicted_angles4[active_angle4_indices],
-            coordinate=sweep_value - base_sweep_value,
-        )
+        if (np.allclose(coefficients, source_start_coefficients, rtol=0, atol=1e-12)
+                and np.max(np.abs(quadcell_errors_from_variables(source_seed_x, *M_start)))
+                <= stage_qc_tolerance):
+            # Keep the real starting state as a candidate; fitting a patch must
+            # not manufacture a staging move when the source is already suitable.
+            payload, correction = point_payload_from_x(source_seed_x), None
+        else:
+            payload, correction = correct_sweep_point(
+                sweep_value,
+                predicted_angles4[active_angle4_indices],
+                coordinate=sweep_value - base_sweep_value,
+            )
         record = {
             "coefficients": np.array(coefficients, dtype=float),
+            "method": "centered_patch_projection",
             "predicted_angles4": np.array(predicted_angles4, dtype=float),
             "sweep_value": float(sweep_value),
             "success": payload is not None,
@@ -7025,8 +8517,30 @@ def plan_reflection_count_surface_stage(
             candidate_records.append(record)
             continue
 
+        record["success"] = False
+        record["centered_endpoint_found"] = True
         stage_x = np.array(payload["x"], dtype=float)
         stage_angles4 = angles4_from_x(stage_x)
+        distance_to_target = metric_distance(stage_angles4, target_angles4)
+        distance4d_to_target = float(np.linalg.norm(stage_angles4 - target_angles4))
+        active3d_distance_to_target = float(np.linalg.norm(
+            stage_angles4[active_angle4_indices] - target_angles4[active_angle4_indices]
+        ))
+        source_motion = float(np.linalg.norm(stage_angles4 - start_angles4))
+        record.update({
+            "payload": payload,
+            "x": stage_x,
+            "mirrors": mirrors_from_x(stage_x),
+            "angles4": stage_angles4,
+            "distance_to_target": distance_to_target,
+            "distance4d_to_target": distance4d_to_target,
+            "active3d_distance_to_target": active3d_distance_to_target,
+            "source_motion": source_motion,
+            "qc_max_abs": float(payload["qc_max_abs"]),
+            "min_u": float(payload["min_u"]),
+            "max_u": float(payload["max_u"]),
+            "closest_edge_margin": float(payload["closest_edge_margin"]),
+        })
         endpoint_diagnostics = actuation_constraint_diagnostics(
             stage_x,
             *M_start,
@@ -7046,10 +8560,179 @@ def plan_reflection_count_surface_stage(
             candidate_records.append(record)
             continue
 
+        record["endpoint_valid"] = True
+        record["path_validation_skipped"] = True
+        candidate_records.append(record)
+
+    centered_endpoints = [record for record in candidate_records if record.get("endpoint_valid")]
+    match_diagnostics = {"enabled": bool(match_target_active_angles and distance_metric == "active_3d"),
+                         "endpoint_qc_limit": float(stage_path_qc_limit),
+                         "centered_best_distance": min(
+                             (record["distance_to_target"] for record in centered_endpoints), default=None)}
+    surface_context["stage_match_diagnostics"] = match_diagnostics
+
+    def matched_stage_record(candidate):
+        x = np.asarray(candidate["x"], dtype=float)
+        payload = point_payload_from_x(x)
+        endpoint = actuation_constraint_diagnostics(
+            x, *M_start, max_qc_error=stage_path_qc_limit, max_qc_difference=None,
+            expected_reflections=source_N_R, u_min=accept_u_min, u_max=accept_u_max,
+            enforce_edge_bounds=True, include_edge_ends=include_edge_ends,
+            constraint_tolerance=float(u_tolerance),
+        )
+        angles = angles4_from_x(x)
+        return {
+            "method": candidate["method"], "predicted_angles4": angles, "angles4": angles,
+            "x": x, "mirrors": mirrors_from_x(x), "payload": payload,
+            "sweep_value": float(angles[sweep_angle4_index]), "success": False,
+            "failure_reason": None if endpoint["ok"] else "; ".join(endpoint["failures"]),
+            "endpoint_valid": bool(endpoint["ok"]), "endpoint_diagnostics": endpoint,
+            "path_validation_skipped": True, "distance_to_target": metric_distance(angles, target_angles4),
+            "distance4d_to_target": float(np.linalg.norm(angles - target_angles4)),
+            "active3d_distance_to_target": float(np.linalg.norm((angles - target_angles4)[active_angle4_indices])),
+            "source_motion": float(np.linalg.norm(angles - start_angles4)),
+            "qc_max_abs": payload["qc_max_abs"], "min_u": payload["min_u"], "max_u": payload["max_u"],
+            "closest_edge_margin": payload["closest_edge_margin"],
+        }
+
+    if match_diagnostics["enabled"]:
+        match_t0 = time.perf_counter()
+        profile_plan("surface_stage stage_target_match begin (fixed active angles, then QC-constrained refinement)")
+        seeds = [source_seed_angles4] + [record["angles4"] for record in sorted(
+            centered_endpoints, key=lambda record: record["distance_to_target"])]
+        extent = np.vstack((source_surface_model["corners4"], target_angles4, seeds))
+        padding = max(0.01, line_step_deg)
+        lower, upper = extent.min(axis=0) - padding, extent.max(axis=0) + padding
+        lower[sweep_angle4_index] = min(
+            source_seed_angles4[sweep_angle4_index] - sweep_half_span_deg, sweep_value_min)
+        upper[sweep_angle4_index] = max(
+            source_seed_angles4[sweep_angle4_index] + sweep_half_span_deg, sweep_value_max)
+        refined, diagnostics = _refine_surface_stage_target_match(
+            *M_start, target_angles4=target_angles4, source_N_R=source_N_R,
+            active_indices=active_angle4_indices, sweep_index=sweep_angle4_index,
+            seeds=seeds, angle_bounds=list(zip(lower, upper)), qc_limit=stage_path_qc_limit,
+            u_min=accept_u_min, u_max=accept_u_max,
+            include_edge_ends=include_edge_ends, u_tolerance=u_tolerance,
+        )
+        match_diagnostics.update(diagnostics)
+        for candidate in refined:
+            x = np.asarray(candidate["x"], dtype=float)
+            if any(record.get("endpoint_valid") and np.linalg.norm(record["x"] - x) <= 1e-9
+                   for record in candidate_records):
+                continue
+            candidate_records.append(matched_stage_record(candidate))
+        add_timing("stage_target_match", time.perf_counter() - match_t0)
+        profile_plan(f"surface_stage stage_target_match done dt={planner_timing['stage_target_match']:.3f}s "
+                     f"exact_match={diagnostics['exact_active_match_found']} "
+                     f"centered_best_distance_deg={match_diagnostics['centered_best_distance']} "
+                     f"refined_best_distance_deg={diagnostics['best_active_distance']}")
+
+    endpoint_valid_candidates = [
+        record for record in candidate_records
+        if record.get("endpoint_valid")
+    ]
+    endpoint_valid_candidates.sort(key=lambda record: (
+        float(record["distance_to_target"]),
+        float(record["source_motion"]),
+        float(record["qc_max_abs"]),
+        -float(record["closest_edge_margin"]),
+    ))
+    profile_plan(f"surface_stage projection_candidates done endpoint_valid={len(endpoint_valid_candidates)}/{len(candidate_records)}")
+    if execute_target_jump and validate_target_sweep:
+        jump_t0 = time.perf_counter()
+        usable_candidates = []
+        local_refinement_attempted = False
+        for candidate_index, record in enumerate(endpoint_valid_candidates, start=1):
+            profile_plan(
+                f"surface_stage target_sweep_validation candidate={candidate_index}/{len(endpoint_valid_candidates)} "
+                f"distance_to_target_deg={record['distance_to_target']:.6g}"
+            )
+            scan = scan_reflection_count_sweep_reacquisition(
+                *record["mirrors"], target_N_R, sweep_actuator=sweep_actuator,
+                qc_reacquire_limit=qc_reacquire_limit, angle_scan_limit=target_sweep_angle_scan_limit,
+                scan_samples=target_sweep_scan_samples, stop_mode=target_sweep_stop_mode,
+                center_tolerance=target_sweep_center_tolerance,
+                u_min=accept_u_min, u_max=accept_u_max,
+            )
+            record["target_sweep_validation"] = scan
+            match_diagnostics.setdefault("jump_candidates_checked", []).append({
+                "distance": float(record["distance_to_target"]), "method": record.get("method"),
+                "success": bool(scan["success"]), "failure_reason": scan["failure_reason"],
+            })
+            profile_plan(
+                f"surface_stage target_sweep_validation result candidate={candidate_index} "
+                f"distance_to_target_deg={record['distance_to_target']:.6g} "
+                f"success={scan['success']} failure={scan['failure_reason']}"
+            )
+            if scan["success"]:
+                usable_candidates.append(record)
+                if len(usable_candidates) >= max_stage_path_candidates:
+                    break
+            else:
+                record["failure_reason"] = "Target sweep: " + scan["failure_reason"]
+                if (match_diagnostics["enabled"] and not local_refinement_attempted and
+                        any(direction.get("rejected_stop") for direction in scan.get("directions", []))):
+                    local_refinement_attempted = True
+                    profile_plan("surface_stage jump_constrained_match begin near closest staging candidate")
+                    refined, diagnostics = _refine_surface_stage_sweep_match(
+                        *M_start, source_x=record["x"], target_angles4=target_angles4,
+                        source_N_R=source_N_R, target_N_R=target_N_R,
+                        active_indices=active_angle4_indices, sweep_index=sweep_angle4_index,
+                        rejected_scan=scan, angle_bounds=list(zip(lower, upper)),
+                        qc_limit=stage_path_qc_limit, qc_reacquire_limit=qc_reacquire_limit,
+                        u_min=accept_u_min, u_max=accept_u_max,
+                        scan_samples=target_sweep_scan_samples, angle_scan_limit=target_sweep_angle_scan_limit,
+                        stop_mode=target_sweep_stop_mode, center_tolerance=target_sweep_center_tolerance,
+                        include_edge_ends=include_edge_ends, u_tolerance=u_tolerance,
+                        max_active_adjustment_deg=max(0.01, min(0.05, line_step_deg)),
+                    )
+                    match_diagnostics["jump_constrained_refinement"] = diagnostics
+                    for candidate in refined:
+                        refined_record = matched_stage_record(candidate)
+                        refined_record["target_sweep_validation"] = candidate["target_sweep_validation"]
+                        candidate_records.append(refined_record)
+                        if refined_record["endpoint_valid"]:
+                            usable_candidates.append(refined_record)
+                            match_diagnostics["jump_candidates_checked"].append({
+                                "distance": refined_record["distance_to_target"],
+                                "method": candidate["method"], "success": True, "failure_reason": None,
+                            })
+                    profile_plan(f"surface_stage jump_constrained_match done success={diagnostics['success']} "
+                                 f"distances_deg={[item['distance'] for item in diagnostics['optimizer_runs']]}")
+                    if len(usable_candidates) >= max_stage_path_candidates:
+                        break
+        endpoint_valid_candidates = sorted(usable_candidates, key=lambda record: (
+            record["distance_to_target"], record["source_motion"], record["qc_max_abs"]))
+        add_timing("target_sweep_validation", time.perf_counter() - jump_t0)
+
+    path_validation_t0 = time.perf_counter()
+    path_validated_candidate_count = 0
+    best_routed_distance = None
+    for candidate_index, record in enumerate(endpoint_valid_candidates[:max_stage_path_candidates], start=1):
+        # Distance is the primary final ranking key; ties still need routing
+        # because path motion is the secondary key.
+        if best_routed_distance is not None and record["distance_to_target"] > best_routed_distance:
+            record["path_skip_reason"] = "strictly worse distance than an already validated route"
+            profile_plan(
+                f"surface_stage route candidate={candidate_index} skipped: {record['path_skip_reason']} "
+                f"distance_deg={record['distance_to_target']:.6g} best_distance_deg={best_routed_distance:.6g}"
+            )
+            break
+        path_validated_candidate_count += 1
+        record["path_validation_skipped"] = False
+        stage_x = np.array(record["x"], dtype=float)
         stage_steps = []
+        route_t0 = time.perf_counter()
+        profile_plan(
+            f"surface_stage route begin candidate={candidate_index}/{min(len(endpoint_valid_candidates), max_stage_path_candidates)} "
+            f"distance_metric={distance_metric} distance_to_target_deg={record['distance_to_target']:.6g} "
+            f"distance_to_target_4d_deg={record['distance4d_to_target']:.6g} "
+            f"stage_distance_from_start_4d_deg={record['source_motion']:.6g} "
+            f"stage_delta_deg=({angle_move_text(x_start, stage_x)})"
+        )
         routed_x, stage_plan = append_waypoint_constrained_path_steps(
             stage_steps,
-            x_start,
+            source_seed_x,
             stage_x,
             *M_start,
             max_axis_splits=stage_max_axis_splits,
@@ -7064,43 +8747,33 @@ def plan_reflection_count_surface_stage(
             enforce_edge_bounds=True,
             include_edge_ends=include_edge_ends,
             constraint_tolerance=float(u_tolerance),
+            profile_callback=(lambda message: profile_plan(f"surface_stage route candidate={candidate_index} " + message)),
         )
         record["path_plan"] = stage_plan
         record["path_reached"] = bool(np.linalg.norm(np.array(routed_x, dtype=float) - stage_x) <= 1e-8)
+        profile_plan(
+            f"surface_stage route done candidate={candidate_index} dt={time.perf_counter() - route_t0:.3f}s "
+            f"steps={len(stage_steps)} reached={record['path_reached']} failure={stage_plan.get('failure_reason')}"
+        )
         if stage_plan.get("failure_reason") is not None or not record["path_reached"]:
             record["success"] = False
             record["failure_reason"] = stage_plan.get(
                 "failure_reason",
                 "stage path did not reach selected endpoint",
             )
-            candidate_records.append(record)
             continue
 
-        path_motion = float(sum(abs(float(step.get("command_value", 0.0))) for step in stage_steps))
-        distance_to_target = metric_distance(stage_angles4, target_angles4)
-        distance4d_to_target = float(np.linalg.norm(stage_angles4 - target_angles4))
-        active3d_distance_to_target = float(np.linalg.norm(
-            stage_angles4[active_angle4_indices] - target_angles4[active_angle4_indices]
+        path_motion = float(sum(
+            abs(float(step.get("command_value", 0.0)))
+            for step in source_repair_steps + stage_steps
         ))
-        source_motion = float(np.linalg.norm(stage_angles4 - start_angles4))
         record.update({
             "success": True,
-            "payload": payload,
-            "x": stage_x,
-            "mirrors": mirrors_from_x(stage_x),
-            "angles4": stage_angles4,
-            "distance_to_target": distance_to_target,
-            "distance4d_to_target": distance4d_to_target,
-            "active3d_distance_to_target": active3d_distance_to_target,
-            "source_motion": source_motion,
             "path_motion": path_motion,
-            "qc_max_abs": float(payload["qc_max_abs"]),
-            "min_u": float(payload["min_u"]),
-            "max_u": float(payload["max_u"]),
-            "closest_edge_margin": float(payload["closest_edge_margin"]),
             "stage_steps": stage_steps,
         })
-        candidate_records.append(record)
+        best_routed_distance = float(record["distance_to_target"])
+    add_timing("candidate_path_validation", time.perf_counter() - path_validation_t0)
     add_timing("candidate_validation", time.perf_counter() - validation_t0)
 
     valid_candidates = [record for record in candidate_records if record.get("success")]
@@ -7109,24 +8782,31 @@ def plan_reflection_count_surface_stage(
             candidate_records,
             key=lambda record: metric_distance(record["predicted_angles4"], target_angles4),
         ) if candidate_records else None
+        sweep_failures = [
+            record["target_sweep_validation"]["failure_reason"]
+            for record in candidate_records
+            if record.get("target_sweep_validation") and not record["target_sweep_validation"]["success"]
+        ]
+        failure_message = "No valid source surface staging point could be projected and routed."
+        if sweep_failures and not endpoint_valid_candidates:
+            failure_message = (
+                f"No staged one-axis sweep has a first QC return at N_R={target_N_R}. "
+                + sweep_failures[0]
+            )
         return failure_result(
-            "No valid source surface staging point could be projected and routed.",
+            failure_message,
             target_base_mirrors=target_mirrors,
             target_base_x=target_x,
             target_center_result=target_center_res,
             source_line_curve=source_line_curve,
-            source_sweep_track={
-                "points": source_sweep_points,
-                "angle_labels": list(angle_labels4),
-                "active_actuators": list(active_labels),
-                "sweep_actuator": sweep_actuator,
-                "base_sweep_value": float(base_sweep_value),
-                "negative_stop_reason": negative_sweep_stop,
-                "positive_stop_reason": positive_sweep_stop,
-            },
-            source_surface_model=None,
+            source_sweep_track=source_sweep_track,
             projection_candidate_count=len(candidate_records),
+            endpoint_valid_candidate_count=len(endpoint_valid_candidates),
+            path_validated_candidate_count=path_validated_candidate_count,
+            max_stage_path_candidates=int(max_stage_path_candidates),
             best_near_miss=near_miss,
+            start_diagnostics=start_diagnostics,
+            source_repair=source_repair,
         )
 
     valid_candidates.sort(key=lambda record: (
@@ -7136,125 +8816,267 @@ def plan_reflection_count_surface_stage(
         -float(record["closest_edge_margin"]),
     ))
     best = valid_candidates[0]
+    match_diagnostics.update(
+        selected_method=best.get("method", "centered_patch_projection"),
+        selected_distance=float(best["distance_to_target"]),
+        selected_qc_max_abs=float(best["qc_max_abs"]),
+        closer_jump_rejections=[
+            {"distance": float(record["distance_to_target"]), "reason": record["failure_reason"]}
+            for record in candidate_records
+            if record.get("target_sweep_validation") and not record["target_sweep_validation"]["success"]
+            and record["distance_to_target"] < best["distance_to_target"]
+        ],
+    )
     stage_x = np.array(best["x"], dtype=float)
     stage_mirrors = best["mirrors"]
     stage_steps = []
-    for source_step in best["stage_steps"]:
+    recovery_step_count = len(source_repair_steps)
+    for source_step in source_repair_steps + best["stage_steps"]:
         step = dict(source_step)
         step["step"] = len(stage_steps) + 1
         step["reflection_count_surface_stage_move"] = True
+        step["source_bound_recovery_step"] = bool(len(stage_steps) < recovery_step_count)
         step["target_jump_step"] = False
-        step["stage_only_refresh"] = True
+        step["stage_only_refresh"] = bool(stage_only_refresh_mode)
         step["target_N_R"] = int(target_N_R)
         step["stage_reflections"] = int(source_N_R)
         step["stage_qc_tolerance"] = float(stage_qc_tolerance)
         step["stage_path_qc_limit"] = float(stage_path_qc_limit)
         stage_steps.append(step)
 
-    plane_corners = []
-    for line_value, sweep_value in (
-            (line_bounds[0], sweep_bounds[0]),
-            (line_bounds[1], sweep_bounds[0]),
-            (line_bounds[1], sweep_bounds[1]),
-            (line_bounds[0], sweep_bounds[1]),
-            (line_bounds[0], sweep_bounds[0])):
-        plane_corners.append(plane_angles([line_value, sweep_value]))
-
-    source_surface_model = {
-        "method": "bounded_local_plane_from_line_and_sweep_endpoints",
-        "angle_labels": list(angle_labels4),
-        "active_actuators": list(active_labels),
-        "sweep_actuator": sweep_actuator,
-        "distance_metric": distance_metric,
+    source_surface_model.update({
+        "source_base_angles4": start_angles4,
+        "source_seed_angles4": source_seed_angles4,
+        "source_center_angles4": source_center_angles4,
+        "target_base_angles4": target_base_angles4,
+        "selected_target_angles4": target_angles4,
         "metric_angle_labels": [angle_labels4[int(idx)] for idx in metric_angle4_indices],
         "metric_angle4_indices": metric_angle4_indices.copy(),
-        "source_base_angles4": start_angles4,
-        "source_center_angles4": source_center_angles4,
-        "target_base_angles4": target_angles4,
-        "line_unit": line_unit,
-        "sweep_unit": sweep_unit,
-        "basis": basis,
-        "metric_basis": metric_basis,
-        "line_bounds": line_bounds,
-        "sweep_bounds": sweep_bounds,
-        "line_norm": float(line_norm),
-        "sweep_norm": float(sweep_norm),
-        "raw_projection_coefficients": np.array(raw_coefficients, dtype=float),
         "projected_coefficients": np.array(projected_coefficients, dtype=float),
         "projected_angles4": plane_angles(projected_coefficients),
-        "selected_coefficients": np.array(best["coefficients"], dtype=float),
+        "selected_coefficients": (
+            np.array(best["coefficients"], dtype=float) if "coefficients" in best else None),
         "selected_predicted_angles4": np.array(best["predicted_angles4"], dtype=float),
         "selected_angles4": np.array(best["angles4"], dtype=float),
-        "plane_corners": np.array(plane_corners, dtype=float),
         "projection_success": bool(projection_res.success),
         "projection_message": str(projection_res.message),
-    }
-    source_sweep_track = {
-        "success": True,
-        "points": source_sweep_points,
-        "angles": sweep_angles,
-        "angle_labels": list(angle_labels4),
-        "active_actuators": list(active_labels),
-        "sweep_actuator": sweep_actuator,
-        "base_sweep_value": float(base_sweep_value),
-        "negative_stop_reason": negative_sweep_stop,
-        "positive_stop_reason": positive_sweep_stop,
-        "sweep_half_span_deg": float(sweep_half_span_deg),
-        "sweep_step_deg": float(sweep_step_deg),
-        "sweep_refinement_levels": int(sweep_refinement_levels),
-    }
+    })
     stage_edge_summary = reflection_edge_summary(stage_x, *M_start, include_ends=include_edge_ends)
     stage_qc = np.array(quadcell_errors_from_variables(stage_x, *M_start), dtype=float)
+    target_jump_steps = []
+    target_jump_x = stage_x.copy()
+    target_jump_motion_total_abs = 0.0
+    target_jump_qc = stage_qc.copy()
+    target_jump_edge_summary = stage_edge_summary
+    target_jump_reflections = int(source_N_R)
+    target_jump_step_primary = None
+
+    if execute_target_jump:
+        sweep_axis_index = int(angle_axes4[sweep_angle4_index])
+        sweep_validation = best.get("target_sweep_validation")
+        jump_goal_x = (
+            np.array(sweep_validation["selected"]["x"], dtype=float)
+            if sweep_validation is not None else selected_target_x
+        )
+        residual_axes = []
+        if target_jump_include_active_residuals and sweep_validation is None:
+            active_axis_indices = [int(angle_axes4[int(idx)]) for idx in active_angle4_indices]
+            residual_axes = sorted(
+                active_axis_indices,
+                key=lambda axis: abs(float(selected_target_x[axis] - stage_x[axis])),
+                reverse=True,
+            )
+        target_axis_order = [sweep_axis_index]
+        for axis in residual_axes:
+            if axis not in target_axis_order:
+                target_axis_order.append(axis)
+
+        x_current_jump = stage_x.copy()
+        total_jump_motion = float(sum(
+            abs(float(jump_goal_x[axis] - x_current_jump[axis]))
+            for axis in target_axis_order
+        ))
+        cumulative_jump_motion = 0.0
+        for axis_index in target_axis_order:
+            amount = float(jump_goal_x[axis_index] - x_current_jump[axis_index])
+            if abs(amount) <= min_angle_step:
+                continue
+            x_next = variables_with_axis_move(x_current_jump, axis_index, amount)
+            cumulative_jump_motion += abs(amount)
+            fraction = (
+                1.0 if total_jump_motion <= 1e-12
+                else min(1.0, cumulative_jump_motion / total_jump_motion)
+            )
+            step = make_actuation_step(
+                len(stage_steps) + len(target_jump_steps) + 1,
+                fraction,
+                x_current_jump,
+                x_next,
+                *M_start,
+                max_qc_error=qc_reacquire_limit,
+                max_qc_difference=None,
+                motion_samples_per_step=1,
+                u_min=accept_u_min,
+                u_max=accept_u_max,
+                include_edge_ends=include_edge_ends,
+                enforce_edge_bounds=False,
+                constraint_tolerance=0.0,
+            )
+            step["reflection_count_target_jump_move"] = True
+            step["reflection_count_reacquisition_move"] = True
+            step["target_jump_step"] = True
+            step["target_center_step"] = False
+            step["target_N_R"] = int(target_N_R)
+            step["stage_reflections"] = int(source_N_R)
+            step["qc_reacquire_limit"] = float(qc_reacquire_limit)
+            step["qc_path_unconstrained"] = True
+            step["reacquire_stop_mode"] = "qc_only"
+            step["surface_stage_target_jump"] = True
+            step["target_sweep_validation"] = sweep_validation
+            step["target_jump_sequence_part"] = (
+                "sweep"
+                if int(axis_index) == int(sweep_axis_index) else
+                "active_residual"
+            )
+            target_jump_steps.append(step)
+            x_current_jump = x_next
+
+        if len(target_jump_steps) == 0:
+            return failure_result(
+                "Surface stage found, but target base has no nonzero target-jump motion.",
+                target_base_mirrors=target_mirrors,
+                target_base_x=target_x,
+                target_center_result=target_center_res,
+                source_line_curve=source_line_curve,
+                source_sweep_track=source_sweep_track,
+                source_surface_model=source_surface_model,
+                stage_mirrors=stage_mirrors,
+                stage_x=stage_x,
+            )
+
+        target_jump_x = x_current_jump.copy()
+        target_jump_mirrors = mirrors_from_x(target_jump_x)
+        target_jump_qc = np.array(
+            quadcell_errors_from_variables(target_jump_x, *M_start),
+            dtype=float,
+        )
+        target_jump_edge_summary = reflection_edge_summary(
+            target_jump_x,
+            *M_start,
+            include_ends=include_edge_ends,
+        )
+        target_jump_reflections = int(get_reflection_count(*target_jump_mirrors))
+        target_jump_motion_total_abs = float(sum(
+            abs(float(step.get("command_value", 0.0)))
+            for step in target_jump_steps
+        ))
+        target_jump_step_primary = target_jump_steps[0]
+
+    final_plan_x = target_jump_x if execute_target_jump else stage_x
+    final_plan_mirrors = mirrors_from_x(final_plan_x)
+    final_plan_qc = np.array(
+        quadcell_errors_from_variables(final_plan_x, *M_start),
+        dtype=float,
+    )
+    final_plan_edge_summary = reflection_edge_summary(
+        final_plan_x,
+        *M_start,
+        include_ends=include_edge_ends,
+    )
+    final_plan_reflections = int(get_reflection_count(*final_plan_mirrors))
+    plan_steps = stage_steps + target_jump_steps
     plan = base_plan(failure_reason=None)
     plan.update({
-        "steps": stage_steps,
-        "n_steps": len(stage_steps),
+        "steps": plan_steps,
+        "n_steps": len(plan_steps),
         "stage_reached": True,
+        "stage_only_refresh": bool(stage_only_refresh_mode),
         "requires_inverse_refresh": True,
-        "suggested_next_step": "take light/dark images and run optimize_inverse, then run the M4 jump from the refreshed state",
+        "qc_only_reacquire_stop": bool(execute_target_jump),
+        "suggested_next_step": (
+            "take light/dark images and run optimize_inverse, then run the M4 jump from the refreshed state"
+            if stage_only_refresh_mode else
+            "take light/dark images and run optimize_inverse, then center quadcells at target N_R"
+        ),
         "target_base_mirrors": target_mirrors,
         "target_base_x": target_x,
         "target_center_result": target_center_res,
         "target_base_N_R": int(target_N_R),
-        "target_base_angles4": target_angles4,
+        "target_sweep_validation": best.get("target_sweep_validation"),
+        "target_base_angles4": target_base_angles4,
+        "start_diagnostics": start_diagnostics,
+        "source_repair": source_repair,
+        "source_repair_applied": bool(source_repair["attempted"]),
+        "source_repair_steps": source_repair_steps,
+        "source_repair_step_count": int(len(source_repair_steps)),
+        "source_seed_x": source_seed_x,
+        "source_seed_mirrors": source_seed_mirrors,
         "stage_mirrors": stage_mirrors,
-        "target_mirrors": stage_mirrors,
+        "target_mirrors": final_plan_mirrors,
         "stage_x": stage_x,
-        "target_x": stage_x,
+        "target_x": final_plan_x,
+        "target_jump_x": target_jump_x if execute_target_jump else None,
         "stage_angles4": np.array(best["angles4"], dtype=float),
-        "target_reflections": int(source_N_R),
+        "target_jump_angles4": (
+            angles4_from_x(target_jump_x) if execute_target_jump else None
+        ),
+        "target_reflections": int(final_plan_reflections),
         "source_center_x": source_center_x,
         "source_center_mirrors": mirrors_from_x(source_center_x),
         "source_line_curve": source_line_curve,
         "source_sweep_track": source_sweep_track,
         "source_surface_model": source_surface_model,
         "stage_plan": best["path_plan"],
-        "target_jump_step": None,
+        "source_repair_path_plan": source_repair.get("path_plan"),
+        "target_jump_step": target_jump_step_primary,
+        "target_jump_steps": target_jump_steps,
+        "target_jump_include_active_residuals": bool(target_jump_include_active_residuals),
+        "target_jump_motion_abs": float(target_jump_motion_total_abs),
+        "target_jump_reflections": int(target_jump_reflections),
+        "target_jump_qc1_error": float(target_jump_qc[0]),
+        "target_jump_qc2_error": float(target_jump_qc[1]),
+        "target_jump_qc_max_abs": float(np.max(np.abs(target_jump_qc))),
         "projection_candidate_count": int(len(candidate_records)),
+        "endpoint_valid_candidate_count": int(len(endpoint_valid_candidates)),
+        "path_validated_candidate_count": path_validated_candidate_count,
+        "max_stage_path_candidates": int(max_stage_path_candidates),
         "valid_projection_candidate_count": int(len(valid_candidates)),
         "selected_candidate": best,
         "projection_candidates": candidate_records,
-        "stage_distance_to_target_base": float(best["distance_to_target"]),
+        "stage_distance_to_target_base": metric_distance(best["angles4"], target_base_angles4),
+        "stage_distance_to_selected_target": float(best["distance_to_target"]),
+        "stage_active3d_distance_to_selected_target": float(best["active3d_distance_to_target"]),
+        "stage_full4d_distance_to_selected_target": float(best["distance4d_to_target"]),
         "stage_distance_metric": distance_metric,
-        "stage_active3d_distance_to_target_base": float(best["active3d_distance_to_target"]),
-        "stage_full4d_distance_to_target_base": float(best["distance4d_to_target"]),
+        "stage_active3d_distance_to_target_base": float(np.linalg.norm(
+            (best["angles4"] - target_base_angles4)[active_angle4_indices])),
+        "stage_full4d_distance_to_target_base": float(np.linalg.norm(best["angles4"] - target_base_angles4)),
         "stage_motion_from_start": float(best["source_motion"]),
         "stage_path_motion_total_abs": float(best["path_motion"]),
         "stage_qc1_error": float(stage_qc[0]),
         "stage_qc2_error": float(stage_qc[1]),
         "stage_qc_max_abs": float(np.max(np.abs(stage_qc))),
-        "final_qc1_error": float(stage_qc[0]),
-        "final_qc2_error": float(stage_qc[1]),
-        "final_qc_difference": float(stage_qc[0] - stage_qc[1]),
-        "final_qc_max_abs": float(np.max(np.abs(stage_qc))),
-        "min_reflection_u": float(stage_edge_summary["min_u"]),
-        "max_reflection_u": float(stage_edge_summary["max_u"]),
-        "reflection_u_values": stage_edge_summary["u_values"],
+        "final_qc1_error": float(final_plan_qc[0]),
+        "final_qc2_error": float(final_plan_qc[1]),
+        "final_qc_difference": float(final_plan_qc[0] - final_plan_qc[1]),
+        "final_qc_max_abs": float(np.max(np.abs(final_plan_qc))),
+        "min_reflection_u": float(final_plan_edge_summary["min_u"]),
+        "max_reflection_u": float(final_plan_edge_summary["max_u"]),
+        "reflection_u_values": final_plan_edge_summary["u_values"],
+        "stage_min_reflection_u": float(stage_edge_summary["min_u"]),
+        "stage_max_reflection_u": float(stage_edge_summary["max_u"]),
+        "stage_reflection_u_values": stage_edge_summary["u_values"],
+        "target_jump_min_reflection_u": float(target_jump_edge_summary["min_u"]),
+        "target_jump_max_reflection_u": float(target_jump_edge_summary["max_u"]),
+        "target_jump_reflection_u_values": target_jump_edge_summary["u_values"],
         "planner_timing": final_timing(),
     })
     res = SimpleNamespace(
         success=True,
         message=(
+            "Same-N_R surface staging point and target reflection-count jump found; "
+            "inverse refresh required after QC reacquisition."
+            if execute_target_jump else
             "Same-N_R surface staging point found; inverse refresh required "
             "before the target reflection-count jump."
         ),
@@ -7263,10 +9085,11 @@ def plan_reflection_count_surface_stage(
         f"surface_stage success total_dt={plan['planner_timing']['total']:.3f}s "
         f"line_points={len(line_points)} sweep_points={len(source_sweep_points)} "
         f"valid_candidates={len(valid_candidates)} "
+        f"target_jump_steps={len(target_jump_steps)} "
         f"distance_metric={distance_metric} distance={best['distance_to_target']:.6g} "
         f"distance4d={best['distance4d_to_target']:.6g}"
     )
-    return stage_mirrors, res, plan
+    return final_plan_mirrors, res, plan
 
 
 def reflection_count_targets_up_to(M1, M2, M3, M4, max_N_R,
@@ -7319,6 +9142,7 @@ def _reflection_count_surface_status_rows(surfaces, failures=None):
             "surface_success": bool(surface.get("success", len(curves) > 0)),
             "plotted": len(curves) > 0,
             "n_curves": len(curves),
+            "n_points": sum(len(curve.get("points", [])) for curve in curves),
             "n_failed_slices": len(failed_slices),
             "n_sweep_values": int(sweep_values.size),
             "n_initial_sweep_values": int(initial_sweep_values.size),
@@ -7376,6 +9200,11 @@ def _reflection_count_surface_status_rows(surfaces, failures=None):
                 None if center_result is None
                 else getattr(center_result, "centered_solution_count", None)
             ),
+            "center_angle_perturb_used": surface.get("center_angle_perturb"),
+            "center_search_attempts": surface.get("center_search_attempts", []),
+            "center_elapsed_s": surface.get("center_elapsed_s"),
+            "trace_elapsed_s": surface.get("trace_elapsed_s"),
+            "family_elapsed_s": surface.get("family_elapsed_s"),
             "failure_reason": surface.get("failure_reason"),
             "first_failed_slice_reason": first_failed_slice.get("failure_reason"),
             "exception": None,
@@ -7388,6 +9217,7 @@ def _reflection_count_surface_status_rows(surfaces, failures=None):
             "surface_success": False,
             "plotted": False,
             "n_curves": 0,
+            "n_points": 0,
             "n_failed_slices": 0,
             "n_sweep_values": 0,
             "n_initial_sweep_values": 0,
@@ -7415,6 +9245,11 @@ def _reflection_count_surface_status_rows(surfaces, failures=None):
             "center_valid_solution_count": None,
             "center_edge_valid_solution_count": None,
             "centered_solution_count": None,
+            "center_angle_perturb_used": None,
+            "center_search_attempts": failure.get("center_search_attempts", []),
+            "center_elapsed_s": None,
+            "trace_elapsed_s": None,
+            "family_elapsed_s": failure.get("family_elapsed_s"),
             "failure_reason": failure.get("failure_reason"),
             "first_failed_slice_reason": None,
             "exception": failure.get("exception"),
@@ -7438,6 +9273,10 @@ def trace_reflection_count_surface_family(
         adaptive_sweep_refinement=False,
         sweep_refinement_levels=4,
         min_sweep_step_deg=1e-4,
+        sweep_expand_to_bounds=True,
+        sweep_max_half_span_deg=None,
+        sweep_max_slices=400,
+        sweep_seed_retries=8,
         preferred_axis=None,
         max_steps_per_side=800,
         step_deg=0.01,
@@ -7457,8 +9296,17 @@ def trace_reflection_count_surface_family(
         center_final_u_tolerance=1e-9,
         chain_center_seed=True,
         continue_on_failure=True,
+        center_retry_angle_scales=DEFAULT_CENTER_RETRY_ANGLE_SCALES,
         **trace_kwargs):
-    """Trace centered-QC surfaces for a sequence of reflection counts."""
+    """Trace centered-QC surfaces, retrying failed seeds at smaller angle spans.
+
+    The first search uses center_angle_perturb unchanged. Narrower retries
+    help find high-reflection topologies near the preceding family member.
+    Set center_retry_angle_scales=(1.0,) to use only the original search.
+    By default the scaled M4 half-span is an initial window, not a hard edge.
+    Multi-seed slices expand to a bracketed boundary within a finite search
+    cap. Set sweep_expand_to_bounds=False to retain a fixed M4 window.
+    """
     base_mirrors = (
         np.array(M1, dtype=float),
         np.array(M2, dtype=float),
@@ -7482,6 +9330,7 @@ def trace_reflection_count_surface_family(
         N_Rs = [int(N_R) for N_R in N_Rs]
     if len(N_Rs) == 0:
         raise ValueError("No reflection counts requested.")
+    center_retry_angle_scales = _normalize_center_retry_angle_scales(center_retry_angle_scales)
     sweep_half_span_deg = float(sweep_half_span_deg)
     sweep_half_span_scale_per_step = float(sweep_half_span_scale_per_step)
     if sweep_half_span_deg < 0:
@@ -7525,8 +9374,11 @@ def trace_reflection_count_surface_family(
 
     sweep_half_span_by_surface_N_R = {}
     accept_u_bounds_by_surface_N_R = {}
+    profile_callback = trace_kwargs.get("profile_callback")
 
     for target_idx, target_N_R in enumerate(N_Rs):
+        surface_t0 = time.perf_counter()
+        center_search_attempts = []
         target_N_R = int(target_N_R)
         target_sweep_half_span = sweep_half_span_by_N_R.get(
             target_N_R,
@@ -7560,6 +9412,8 @@ def trace_reflection_count_surface_family(
                 seed_N_R = int(last_successful_N_R)
                 seed_source = "last_successful"
 
+        if profile_callback is not None:
+            profile_callback(f"family N_R={target_N_R} start seed_N_R={seed_N_R}")
         try:
             if target_N_R == initial_N_R:
                 surface = trace_centered_quadcell_angle_surface(
@@ -7573,6 +9427,10 @@ def trace_reflection_count_surface_family(
                     adaptive_sweep_refinement=adaptive_sweep_refinement,
                     sweep_refinement_levels=sweep_refinement_levels,
                     min_sweep_step_deg=min_sweep_step_deg,
+                    sweep_expand_to_bounds=sweep_expand_to_bounds,
+                    sweep_max_half_span_deg=sweep_max_half_span_deg,
+                    sweep_max_slices=sweep_max_slices,
+                    sweep_seed_retries=sweep_seed_retries,
                     preferred_axis=preferred_axis,
                     max_steps_per_side=max_steps_per_side,
                     step_deg=step_deg,
@@ -7591,6 +9449,7 @@ def trace_reflection_count_surface_family(
                     N_R=target_N_R,
                     center_n_tries=center_n_tries,
                     center_angle_perturb=center_angle_perturb,
+                    center_retry_angle_scales=center_retry_angle_scales,
                     center_seed=center_seed,
                     center_u_min=center_u_min,
                     center_u_max=center_u_max,
@@ -7606,6 +9465,10 @@ def trace_reflection_count_surface_family(
                     adaptive_sweep_refinement=adaptive_sweep_refinement,
                     sweep_refinement_levels=sweep_refinement_levels,
                     min_sweep_step_deg=min_sweep_step_deg,
+                    sweep_expand_to_bounds=sweep_expand_to_bounds,
+                    sweep_max_half_span_deg=sweep_max_half_span_deg,
+                    sweep_max_slices=sweep_max_slices,
+                    sweep_seed_retries=sweep_seed_retries,
                     preferred_axis=preferred_axis,
                     max_steps_per_side=max_steps_per_side,
                     step_deg=step_deg,
@@ -7616,7 +9479,10 @@ def trace_reflection_count_surface_family(
                     accept_u_max=target_accept_u_max,
                     **trace_kwargs,
                 )
+                center_search_attempts = surface["center_search_attempts"]
 
+            surface["center_search_attempts"] = center_search_attempts
+            surface["family_elapsed_s"] = time.perf_counter() - surface_t0
             surface["family_N_R"] = target_N_R
             surface["family_label"] = f"N_R={target_N_R}"
             surface["family_seed_N_R"] = int(seed_N_R)
@@ -7629,7 +9495,14 @@ def trace_reflection_count_surface_family(
             seed_source_by_N_R[target_N_R] = seed_source
             last_successful_mirrors = centered_mirrors
             last_successful_N_R = target_N_R
+            if profile_callback is not None:
+                profile_callback(
+                    f"family N_R={target_N_R} done curves={len(surface.get('curves', []))} "
+                    f"points={sum(len(curve.get('points', [])) for curve in surface.get('curves', []))} "
+                    f"elapsed={surface['family_elapsed_s']:.2f}s"
+                )
         except Exception as exc:
+            center_search_attempts = getattr(exc, "center_search_attempts", center_search_attempts)
             failure = {
                 "N_R": target_N_R,
                 "seed_N_R": int(seed_N_R),
@@ -7643,6 +9516,8 @@ def trace_reflection_count_surface_family(
                 "accept_u_min": float(target_accept_u_min),
                 "accept_u_max": float(target_accept_u_max),
                 "failure_reason": str(exc),
+                "center_search_attempts": center_search_attempts,
+                "family_elapsed_s": time.perf_counter() - surface_t0,
                 "exception": exc,
             }
             failures.append(failure)
@@ -7680,6 +9555,10 @@ def trace_reflection_count_surface_family(
         "active_actuators": list(active_actuators),
         "sweep_actuator": sweep_actuator,
         "sweep_half_span_scale_per_step": float(sweep_half_span_scale_per_step),
+        "sweep_expand_to_bounds": bool(sweep_expand_to_bounds),
+        "sweep_max_half_span_deg": sweep_max_half_span_deg,
+        "sweep_max_slices": int(sweep_max_slices),
+        "sweep_seed_retries": int(sweep_seed_retries),
         "sweep_half_span_by_N_R": {
             int(N_R): float(span)
             for N_R, span in sweep_half_span_by_N_R.items()
@@ -7699,6 +9578,7 @@ def trace_reflection_count_surface_family(
         "center_kwargs": {
             "center_n_tries": int(center_n_tries),
             "center_angle_perturb": float(center_angle_perturb),
+            "center_retry_angle_scales": center_retry_angle_scales,
             "center_seed": None if center_seed is None else int(center_seed),
             "center_u_min": None if center_u_min is None else float(center_u_min),
             "center_u_max": None if center_u_max is None else float(center_u_max),
@@ -9497,8 +11377,22 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                                              tubes=None,
                                              tube_labels=None,
                                              tube_opacity=0.18,
-                                             tube_color="rgba(35, 170, 255, 0.55)"):
-    """Overlay centered-QC slice surfaces in 3D, using color for the swept angle."""
+                                             tube_color="rgba(35, 170, 255, 0.55)",
+                                             color_by="sweep", cmap="viridis",
+                                             marker_symbol=None):
+    """Overlay surfaces colored by sweep angle or discrete reflection count.
+
+    color_by="N_R" assigns one evenly spaced cmap color per distinct
+    reflection count, irrespective of the numerical gaps between counts.
+    cmap accepts a Matplotlib colormap name, including reversed names (_r).
+    marker_symbol="circle" uses round markers for every surface; None cycles
+    shapes between surfaces. Reference configurations retain their diamonds.
+    """
+    color_by_key = str(color_by).lower()
+    if color_by_key not in ("sweep", "n_r"):
+        raise ValueError("color_by must be 'sweep' or 'N_R'.")
+    color_by_reflections = color_by_key == "n_r"
+    cmap = plt.get_cmap(cmap)
     if isinstance(surfaces, dict):
         surfaces = [surfaces]
     surfaces = list(surfaces)
@@ -9513,6 +11407,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
     labels = list(labels)
     if len(labels) != len(surfaces):
         raise ValueError("labels must have the same length as surfaces.")
+    labels = [str(label).replace("N_R", "N<sub>R</sub>") for label in labels]
 
     if clouds is None:
         clouds = []
@@ -9528,6 +11423,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
     cloud_labels = list(cloud_labels)
     if len(cloud_labels) != len(clouds):
         raise ValueError("cloud_labels must have the same length as clouds.")
+    cloud_labels = [str(label).replace("N_R", "N<sub>R</sub>") for label in cloud_labels]
 
     if tubes is None:
         tubes = []
@@ -9543,6 +11439,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
     tube_labels = list(tube_labels)
     if len(tube_labels) != len(tubes):
         raise ValueError("tube_labels must have the same length as tubes.")
+    tube_labels = [str(label).replace("N_R", "N<sub>R</sub>") for label in tube_labels]
 
     nonempty_surfaces = [
         surface for surface in surfaces
@@ -9601,8 +11498,44 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
         if len(sweep_actuators) == 1
         else "swept angle (deg)"
     )
+    colorscale = [
+        (float(position), _rgba_from_colormap_value(position, 0, 1, cmap_name=cmap))
+        for position in np.linspace(0.0, 1.0, 256)
+    ]
+    reflection_color_indices = {}
+    reflection_colors = []
+
+    def reflection_count_for_plot(dataset):
+        value = dataset.get("target_reflections", dataset.get("family_N_R"))
+        if value is None:
+            raise ValueError("color_by='N_R' requires target_reflections on each plotted dataset.")
+        return int(value)
+
+    if color_by_reflections:
+        colored_datasets = nonempty_surfaces + [cloud for cloud in clouds if len(cloud.get("points", [])) > 0]
+        reflection_counts = sorted({reflection_count_for_plot(dataset) for dataset in colored_datasets})
+        reflection_color_indices = {count: idx for idx, count in enumerate(reflection_counts)}
+        n_colors = len(reflection_counts)
+        reflection_colors = [
+            _rgba_from_colormap_value(idx, 0, n_colors - 1, cmap_name=cmap)
+            for idx in range(n_colors)
+        ]
+        colorscale = []
+        for idx, color in enumerate(reflection_colors):
+            colorscale.extend([(idx / n_colors, color), ((idx + 1) / n_colors, color)])
+        cmin, cmax = -0.5, n_colors - 0.5
+        colorbar_title = "N<sub>R</sub>"
     symbols = ["circle", "diamond", "square", "cross", "x"]
-    plot_title = title if title is not None else "Centered-QC angle surface slices"
+    if marker_symbol is not None:
+        if marker_symbol not in (
+                "circle", "circle-open", "diamond", "diamond-open",
+                "square", "square-open", "cross", "x"):
+            raise ValueError("marker_symbol must be a Scatter3d marker symbol or None.")
+        symbols = [marker_symbol]
+    plot_title = (
+        str(title).replace("N_R", "N<sub>R</sub>")
+        if title is not None else "Centered-QC angle surface slices"
+    )
 
     prepared = []
     for surface_idx, (surface, surface_label) in enumerate(zip(surfaces, labels)):
@@ -9653,6 +11586,10 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 "axis_indices": axis_indices,
                 "coordinates": coordinates,
                 "sweep_value": sweep_value,
+                "color_value": (
+                    reflection_color_indices[reflection_count_for_plot(surface)]
+                    if color_by_reflections else sweep_value
+                ),
                 "customdata": point_customdata,
                 "symbol": symbols[surface_idx % len(symbols)],
                 "start_index": int(np.argmin(np.abs(coordinates))) if coordinates.size else 0,
@@ -9704,6 +11641,10 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
             "y": y_values,
             "z": z_values,
             "sweep_values": np.array(sweep_values, dtype=float),
+            "color_values": (
+                np.full(len(points), reflection_color_indices[reflection_count_for_plot(cloud)])
+                if color_by_reflections else np.array(sweep_values, dtype=float)
+            ),
             "customdata": customdata,
         })
 
@@ -9799,7 +11740,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
         "QC max: %{customdata[3]:.4g} mm<br>"
         "u range: [%{customdata[4]:.4f}, %{customdata[5]:.4f}]<br>"
         "edge margin: %{customdata[6]:.4f}<br>"
-        "N_R: %{customdata[7]:.0f}<br>"
+        "N<sub>R</sub>: %{customdata[7]:.0f}<br>"
         "point: %{customdata[8]:.0f}<extra></extra>"
     )
     reference_hovertemplate = (
@@ -9812,7 +11753,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
         "QC max: %{customdata[4]:.4g} mm<br>"
         "u range: [%{customdata[5]:.4f}, %{customdata[6]:.4f}]<br>"
         "edge margin: %{customdata[7]:.4f}<br>"
-        "N_R: %{customdata[8]:.0f}<extra></extra>"
+        "N<sub>R</sub>: %{customdata[8]:.0f}<extra></extra>"
     )
     cloud_hovertemplate = (
         "%{customdata[0]}<br>"
@@ -9824,7 +11765,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
         "QC max: %{customdata[4]:.4g} mm<br>"
         "u range: [%{customdata[5]:.4f}, %{customdata[6]:.4f}]<br>"
         "edge margin: %{customdata[7]:.4f}<br>"
-        "N_R: %{customdata[8]:.0f}<br>"
+        "N<sub>R</sub>: %{customdata[8]:.0f}<br>"
         "cloud point: %{customdata[9]:.0f}<br>"
         "offset radius: %{customdata[10]:.4f} deg<br>"
         "source: curve %{customdata[11]:.0f}, point %{customdata[12]:.0f}<br>"
@@ -9855,6 +11796,50 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
         for surface_idx in range(len(labels))
     }
 
+    # Keep range lookup tied to actuator names, formatting labels only for display.
+    surface_scene = _plotly_3d_scene(axis_titles, axis_ranges=axis_ranges)
+    surface_scene["domain"] = {"x": [0.0, 0.78], "y": [0.0, 1.0]}
+    for axis_key, axis_title in zip(("xaxis", "yaxis", "zaxis"), axis_titles):
+        display_title = axis_title.replace(".dangle", " angle")
+        surface_scene[axis_key].update({
+            "title": {"text": f"{display_title} (degrees)", "font": {"size": 18}},
+            "tickfont": {"size": 14},
+        })
+    surface_colorbar = {
+        "title": {"text": colorbar_title.replace(".dangle", " angle").replace(" (deg)", "<br>(degrees)"),
+                  "font": {"size": 18}},
+        "tickfont": {"size": 14},
+        "x": 0.81,
+        "xanchor": "left",
+        "y": 0.5,
+        "len": 0.80,
+        "thickness": 20,
+    }
+    if color_by_reflections:
+        surface_colorbar.update({
+            "tickmode": "array",
+            "tickvals": list(range(len(reflection_counts))),
+            "ticktext": [str(count) for count in reflection_counts],
+        })
+
+    def surface_legend_color(surface_index):
+        if color_by_reflections:
+            color_index = reflection_color_indices[reflection_count_for_plot(surfaces[surface_index])]
+            return reflection_colors[color_index]
+        return "rgba(90,90,90,0.85)"
+
+    def curve_line_color(item):
+        if color_by_reflections:
+            return reflection_colors[item["color_value"]]
+        return _rgba_from_colormap_value(
+            item["sweep_value"], cmin, cmax, cmap_name=cmap, alpha=opacity,
+        )
+    surface_legend = {
+        "itemsizing": "constant", "groupclick": "togglegroup",
+        "x": 1.02, "xanchor": "left", "y": 1.0, "yanchor": "top",
+    }
+    surface_margin = {"l": 0, "r": 210, "t": 50, "b": 10}
+
     try:
         import plotly.graph_objects as go
 
@@ -9869,7 +11854,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                     marker={
                         "size": max(float(marker_size) + 3.0, 7.0),
                         "symbol": symbols[surface_idx % len(symbols)],
-                        "color": "rgba(90,90,90,0.85)",
+                        "color": surface_legend_color(surface_idx),
                     },
                     name=surface_label,
                     showlegend=True,
@@ -9884,7 +11869,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
             y_values = angles[:, axis_indices[1]]
             z_values = angles[:, axis_indices[2]]
             sweep_value = item["sweep_value"]
-            line_color = _rgba_from_colormap_value(sweep_value, cmin, cmax, alpha=opacity)
+            line_color = curve_line_color(item)
             fig.add_trace(go.Scatter3d(
                 x=x_values,
                 y=y_values,
@@ -9893,7 +11878,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 marker={
                     "size": float(marker_size),
                     "symbol": item["symbol"],
-                    "color": [sweep_value] * len(x_values),
+                    "color": [item["color_value"]] * len(x_values),
                     "coloraxis": "coloraxis",
                 },
                 line={"width": 4, "color": line_color},
@@ -9914,7 +11899,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                     marker={
                         "size": max(float(marker_size) + 3.0, 7.0),
                         "symbol": item["symbol"],
-                        "color": [sweep_value],
+                        "color": [item["color_value"]],
                         "coloraxis": "coloraxis",
                         "line": {"color": "black", "width": 2},
                     },
@@ -9925,7 +11910,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 ))
 
         for item in reference_items:
-            reference_group = surface_legendgroups[item["surface_index"]]
+            reference_group = f"surface-reference-{item['surface_index']}"
             fig.add_trace(go.Scatter3d(
                 x=[item["x"]],
                 y=[item["y"]],
@@ -9939,8 +11924,8 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 },
                 customdata=item["customdata"],
                 hovertemplate=reference_hovertemplate,
-                name=f"{item['surface_label']} base",
-                showlegend=not surface_has_prepared.get(item["surface_index"], False),
+                name=f"{item['surface_label']} reference",
+                showlegend=True,
                 legendgroup=reference_group,
             ))
 
@@ -9969,7 +11954,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 mode="markers",
                 marker={
                     "size": float(cloud_marker_size),
-                    "color": item["sweep_values"],
+                    "color": item["color_values"],
                     "coloraxis": "coloraxis",
                     "symbol": "circle",
                 },
@@ -9984,15 +11969,15 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
             title=plot_title,
             width=None if width == "100%" else width,
             height=int(height),
-            scene=_plotly_3d_scene(axis_titles, axis_ranges=axis_ranges),
+            scene=surface_scene,
             coloraxis={
-                "colorscale": "Viridis",
+                "colorscale": colorscale,
                 "cmin": cmin,
                 "cmax": cmax,
-                "colorbar": {"title": colorbar_title},
+                "colorbar": surface_colorbar,
             },
-            margin={"l": 0, "r": 0, "t": 40, "b": 0},
-            legend={"itemsizing": "constant", "groupclick": "togglegroup"},
+            margin=surface_margin,
+            legend=surface_legend,
         )
         if show:
             if renderer is not None:
@@ -10020,7 +12005,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                     "marker": {
                         "size": max(float(marker_size) + 3.0, 7.0),
                         "symbol": symbols[surface_idx % len(symbols)],
-                        "color": "rgba(90,90,90,0.85)",
+                        "color": surface_legend_color(surface_idx),
                     },
                     "name": surface_label,
                     "showlegend": True,
@@ -10035,7 +12020,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
             y_values = angles[:, axis_indices[1]]
             z_values = angles[:, axis_indices[2]]
             sweep_value = item["sweep_value"]
-            line_color = _rgba_from_colormap_value(sweep_value, cmin, cmax, alpha=opacity)
+            line_color = curve_line_color(item)
             traces.append({
                 "type": "scatter3d",
                 "mode": "lines+markers",
@@ -10045,7 +12030,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 "marker": {
                     "size": float(marker_size),
                     "symbol": item["symbol"],
-                    "color": [sweep_value] * len(x_values),
+                    "color": [item["color_value"]] * len(x_values),
                     "coloraxis": "coloraxis",
                 },
                 "line": {"width": 4, "color": line_color},
@@ -10067,7 +12052,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                     "marker": {
                         "size": max(float(marker_size) + 3.0, 7.0),
                         "symbol": item["symbol"],
-                        "color": [sweep_value],
+                        "color": [item["color_value"]],
                         "coloraxis": "coloraxis",
                         "line": {"color": "black", "width": 2},
                     },
@@ -10092,9 +12077,9 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 },
                 "customdata": item["customdata"],
                 "hovertemplate": reference_hovertemplate,
-                "name": f"{item['surface_label']} base",
-                "showlegend": not surface_has_prepared.get(item["surface_index"], False),
-                "legendgroup": surface_legendgroups[item["surface_index"]],
+                "name": f"{item['surface_label']} reference",
+                "showlegend": True,
+                "legendgroup": f"surface-reference-{item['surface_index']}",
             })
 
         for item in prepared_tubes:
@@ -10124,7 +12109,7 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
                 "z": item["z"].tolist(),
                 "marker": {
                     "size": float(cloud_marker_size),
-                    "color": item["sweep_values"].tolist(),
+                    "color": item["color_values"].tolist(),
                     "coloraxis": "coloraxis",
                     "symbol": "circle",
                 },
@@ -10141,15 +12126,15 @@ def plot_centered_quadcell_angle_surfaces_3d(surfaces, labels=None, axes=None,
             "layout": {
                 "title": plot_title,
                 "height": int(height),
-                "scene": _plotly_3d_scene(axis_titles, axis_ranges=axis_ranges),
+                "scene": surface_scene,
                 "coloraxis": {
-                    "colorscale": "Viridis",
+                    "colorscale": colorscale,
                     "cmin": cmin,
                     "cmax": cmax,
-                    "colorbar": {"title": colorbar_title},
+                    "colorbar": surface_colorbar,
                 },
-                "margin": {"l": 0, "r": 0, "t": 40, "b": 0},
-                "legend": {"itemsizing": "constant", "groupclick": "togglegroup"},
+                "margin": surface_margin,
+                "legend": surface_legend,
             },
             "config": {"responsive": True, "displaylogo": False},
         }
@@ -10182,8 +12167,10 @@ def plot_reflection_count_surface_family_3d(family, axes=None, tubes=None,
                                             tube_labels=None, tube_color=None,
                                             renderer=None,
                                             show_empty_surface_reference_markers=False,
+                                            color_by="sweep", cmap="viridis",
+                                            marker_symbol=None,
                                             **plot_kwargs):
-    """Plot surfaces from a reflection-count surface family."""
+    """Plot a family with sweep-angle coloring or color_by="N_R" categories."""
     surfaces = list(family.get("surfaces", []))
     if len(surfaces) == 0:
         raise ValueError("family contains no surfaces to plot.")
@@ -10214,8 +12201,441 @@ def plot_reflection_count_surface_family_3d(family, axes=None, tubes=None,
         ),
         show_empty_surface_reference_markers=show_empty_surface_reference_markers,
         renderer=renderer,
+        color_by=color_by,
+        cmap=cmap,
+        marker_symbol=marker_symbol,
         **plot_kwargs,
     )
+
+
+def _reflection_count_surface_from_collection(surface_or_family, N_R=None):
+    """Select one traced surface from either a surface or family dictionary."""
+    if not isinstance(surface_or_family, dict):
+        raise TypeError("surface_or_family must be a surface or family dictionary.")
+
+    if "surfaces" not in surface_or_family:
+        surface = surface_or_family
+        surface_N_R = surface.get("target_reflections")
+        if N_R is not None and surface_N_R is not None and int(surface_N_R) != int(N_R):
+            raise ValueError(
+                f"Surface has N_R={surface_N_R}, not requested N_R={int(N_R)}."
+            )
+        return surface
+
+    surfaces = list(surface_or_family.get("surfaces", []))
+    if len(surfaces) == 0:
+        raise ValueError("family contains no successfully traced surfaces.")
+    if N_R is None:
+        return surfaces[0]
+
+    matches = [
+        surface for surface in surfaces
+        if int(surface.get("target_reflections", -1)) == int(N_R)
+    ]
+    if len(matches) == 0:
+        available = [surface.get("target_reflections") for surface in surfaces]
+        raise ValueError(f"No N_R={int(N_R)} surface is present; available values are {available}.")
+    return matches[0]
+
+
+def extract_reflection_count_surface_boundary(surface_or_family, N_R=None,
+                                               edge="perimeter"):
+    """Return ordered records along an outer edge of a traced angle surface.
+
+    ``positive_branch`` and ``negative_branch`` select one endpoint from every
+    fixed-sweep curve. ``min_sweep`` and ``max_sweep`` select the full curve at
+    the two sweep extremes. ``perimeter`` walks all four edges without
+    repeating corner points.
+    """
+    surface = _reflection_count_surface_from_collection(surface_or_family, N_R=N_R)
+    curves = [
+        curve for curve in surface.get("curves", [])
+        if len(curve.get("points", [])) > 0
+    ]
+    if len(curves) == 0:
+        raise ValueError("selected surface contains no successfully traced curves.")
+    curves = sorted(curves, key=lambda curve: float(curve.get("sweep_value", np.nan)))
+
+    aliases = {
+        "low_coordinate": "negative_branch",
+        "negative": "negative_branch",
+        "negative_branch": "negative_branch",
+        "high_coordinate": "positive_branch",
+        "positive": "positive_branch",
+        "positive_branch": "positive_branch",
+        "minimum_sweep": "min_sweep",
+        "min_sweep": "min_sweep",
+        "maximum_sweep": "max_sweep",
+        "max_sweep": "max_sweep",
+        "perimeter": "perimeter",
+    }
+    edge_key = aliases.get(str(edge).lower())
+    if edge_key is None:
+        raise ValueError(
+            "edge must be one of 'positive_branch', 'negative_branch', "
+            "'min_sweep', 'max_sweep', or 'perimeter'."
+        )
+
+    def ordered_point_indices(curve):
+        points = list(curve.get("points", []))
+        coordinates = np.array(
+            curve.get("coordinates", [point.get("coordinate", idx) for idx, point in enumerate(points)]),
+            dtype=float,
+        )
+        if coordinates.size != len(points):
+            coordinates = np.arange(len(points), dtype=float)
+        return list(np.argsort(coordinates, kind="stable"))
+
+    point_orders = [ordered_point_indices(curve) for curve in curves]
+    selections = []
+    if edge_key == "negative_branch":
+        selections = [(idx, point_orders[idx][0], edge_key) for idx in range(len(curves))]
+    elif edge_key == "positive_branch":
+        selections = [(idx, point_orders[idx][-1], edge_key) for idx in range(len(curves))]
+    elif edge_key == "min_sweep":
+        selections = [(0, point_idx, edge_key) for point_idx in point_orders[0]]
+    elif edge_key == "max_sweep":
+        last = len(curves) - 1
+        selections = [(last, point_idx, edge_key) for point_idx in point_orders[last]]
+    elif len(curves) == 1:
+        selections = [(0, point_idx, "min_sweep") for point_idx in point_orders[0]]
+    else:
+        # Preserve the positive-branch direction used by the single-edge GIF,
+        # then turn around the maximum-sweep, negative-branch, and minimum-
+        # sweep edges. The GIF's last-to-first transition closes the loop.
+        last = len(curves) - 1
+        selections.extend((idx, point_orders[idx][-1], "positive_branch")
+                          for idx in range(len(curves)))
+        selections.extend((last, point_idx, "max_sweep")
+                          for point_idx in reversed(point_orders[last][:-1]))
+        selections.extend((idx, point_orders[idx][0], "negative_branch")
+                          for idx in range(last - 1, -1, -1))
+        selections.extend((0, point_idx, "min_sweep")
+                          for point_idx in point_orders[0][1:-1])
+
+    base_mirrors = surface.get("base_mirrors")
+    if base_mirrors is None:
+        base_mirrors = surface.get("centered_mirrors")
+    if base_mirrors is None:
+        raise ValueError("selected surface does not contain base_mirrors.")
+    base_mirrors = tuple(np.array(mirror, dtype=float) for mirror in base_mirrors)
+    records = []
+    for boundary_index, (curve_index, point_index, edge_segment) in enumerate(selections):
+        curve = curves[curve_index]
+        point = curve["points"][point_index]
+        x = np.array(point["x"], dtype=float)
+        reference_mirrors = curve.get("slice_mirrors", base_mirrors)
+        mirrors = tuple(
+            np.array(mirror, dtype=float)
+            for mirror in unpack_variables(x, *reference_mirrors)
+        )
+        coordinates = np.array(
+            curve.get("coordinates", [p.get("coordinate", idx)
+                                      for idx, p in enumerate(curve["points"])]),
+            dtype=float,
+        )
+        records.append({
+            "boundary_index": int(boundary_index),
+            "edge_segment": edge_segment,
+            "curve_index": int(curve_index),
+            "point_index": int(point_index),
+            "sweep_value": float(curve.get("sweep_value", point.get("sweep_value", np.nan))),
+            "coordinate": float(coordinates[point_index]),
+            "angles": np.array(point["angles"], dtype=float),
+            "angles4": np.array([mirror[2] for mirror in mirrors], dtype=float),
+            "angle_labels": list(curve.get("angle_labels", surface.get("active_actuators", []))),
+            "x": x,
+            "mirrors": mirrors,
+            "qc": np.array(point.get("qc", [np.nan, np.nan]), dtype=float),
+            "qc_max_abs": float(point.get("qc_max_abs", np.nan)),
+            "reflection_count": int(point.get(
+                "reflection_count", surface.get("target_reflections", -1)
+            )),
+            "min_u": float(point.get("min_u", np.nan)),
+            "max_u": float(point.get("max_u", np.nan)),
+            "closest_edge_margin": float(point.get("closest_edge_margin", np.nan)),
+            "point": point,
+        })
+
+    return {
+        "surface": surface,
+        "target_reflections": int(surface.get("target_reflections", records[0]["reflection_count"])),
+        "edge": edge_key,
+        "records": records,
+        "frame_count": int(len(records)),
+        "active_actuators": list(surface.get("active_actuators", records[0]["angle_labels"])),
+        "sweep_actuator": surface.get("sweep_actuator", "M4.dangle"),
+    }
+
+
+def _surface_boundary_axis_setup(boundary, axes):
+    surface = boundary["surface"]
+    first_curve = surface["curves"][0]
+    angle_labels = list(first_curve.get("angle_labels", surface.get("active_actuators", [])))
+    axis_labels = angle_labels[:3] if axes is None else list(axes)
+    if len(axis_labels) != 3:
+        raise ValueError("axes must contain exactly three active-actuator labels.")
+    axis_indices = []
+    for label in axis_labels:
+        if label not in angle_labels:
+            raise ValueError(f"axis {label!r} is not in surface labels {angle_labels}.")
+        axis_indices.append(angle_labels.index(label))
+    return axis_labels, axis_indices
+
+
+def render_reflection_count_surface_boundary_frame_3d(
+        boundary, frame_index=0,
+        axes=("M1.dangle", "M2.dangle", "M3.dangle"),
+        figsize=(9, 7), dpi=110, elev=22.0, azim=-58.0, roll=0.0,
+        radius=3.0,
+        axis_ranges=None, marker_size=2.2, highlight_size=90,
+        title=None):
+    """Render one static angle-surface frame with its boundary point in red."""
+    if not isinstance(boundary, dict) or "records" not in boundary:
+        boundary = extract_reflection_count_surface_boundary(boundary)
+    records = boundary["records"]
+    if frame_index < 0 or frame_index >= len(records):
+        raise IndexError(f"frame_index {frame_index} outside 0..{len(records) - 1}.")
+    radius = float(radius)
+    if radius <= 0:
+        raise ValueError("radius must be positive.")
+    record = records[frame_index]
+    surface = boundary["surface"]
+    axis_labels, axis_indices = _surface_boundary_axis_setup(boundary, axes)
+
+    sweep_values = np.array([
+        float(curve.get("sweep_value", np.nan)) for curve in surface.get("curves", [])
+    ], dtype=float)
+    finite_sweep = sweep_values[np.isfinite(sweep_values)]
+    cmin = float(np.min(finite_sweep)) if finite_sweep.size else 0.0
+    cmax = float(np.max(finite_sweep)) if finite_sweep.size else 1.0
+    if cmax <= cmin:
+        cmax = cmin + 1.0
+    cmap = plt.get_cmap("viridis")
+
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    ax = fig.add_subplot(111, projection="3d")
+    for curve in surface.get("curves", []):
+        angles = np.array(curve.get("angles", []), dtype=float)
+        if angles.ndim != 2 or len(angles) == 0:
+            continue
+        sweep_value = float(curve.get("sweep_value", cmin))
+        color = cmap(np.clip((sweep_value - cmin) / (cmax - cmin), 0.0, 1.0))
+        values = angles[:, axis_indices]
+        ax.plot(
+            values[:, 0], values[:, 1], values[:, 2],
+            color=color, linewidth=0.9, marker="o", markersize=marker_size,
+            markeredgewidth=0.0, alpha=0.95,
+        )
+
+    highlight = np.array(record["angles"], dtype=float)[axis_indices]
+    ax.scatter(
+        [highlight[0]], [highlight[1]], [highlight[2]],
+        s=float(highlight_size), color="red", edgecolor="darkred",
+        linewidth=1.2, depthshade=False, zorder=20,
+        label="current boundary point",
+    )
+    base_point = surface.get("base_point")
+    if isinstance(base_point, dict) and len(base_point.get("angles", [])) >= 3:
+        base = np.array(base_point["angles"], dtype=float)[axis_indices]
+        ax.scatter(
+            [base[0]], [base[1]], [base[2]], s=55, color="black",
+            marker="D", depthshade=False, label="base configuration",
+        )
+
+    ax.set_xlabel(axis_labels[0])
+    ax.set_ylabel(axis_labels[1])
+    ax.set_zlabel(axis_labels[2])
+    if axis_ranges is not None:
+        limits = []
+        for label in axis_labels:
+            if isinstance(axis_ranges, dict):
+                limits.append(axis_ranges.get(label))
+            else:
+                limits.append(axis_ranges[len(limits)])
+        for setter, limits_for_axis in zip((ax.set_xlim, ax.set_ylim, ax.set_zlim), limits):
+            if limits_for_axis is not None:
+                setter(*limits_for_axis)
+    try:
+        ax.view_init(elev=float(elev), azim=float(azim), roll=float(roll))
+    except TypeError:
+        ax.view_init(elev=float(elev), azim=float(azim))
+    camera_zoom = 3.0 / radius
+    try:
+        ax.set_box_aspect(None, zoom=camera_zoom)
+    except TypeError:
+        # Compatibility with Matplotlib versions predating the zoom argument.
+        ax.dist = 10.0 / camera_zoom
+
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+    colorbar = fig.colorbar(
+        ScalarMappable(norm=Normalize(vmin=cmin, vmax=cmax), cmap=cmap),
+        ax=ax, pad=0.10, shrink=0.72,
+    )
+    colorbar.set_label(f"{boundary['sweep_actuator']} (deg)")
+    frame_title = title or f"N_R={boundary['target_reflections']} centered-QC surface boundary"
+    ax.set_title(
+        f"{frame_title}\n"
+        f"point {frame_index + 1}/{len(records)} | {record['edge_segment']} | "
+        f"M4={record['angles4'][3]:.6f} deg"
+    )
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    return fig, ax
+
+
+def render_reflection_count_surface_boundary_simulation_frame(
+        boundary, frame_index=0, figsize=(10, 5), dpi=110,
+        xlim=(-320, 230), ylim=(-15, 215), qc_window=2.0,
+        draw_mount_outline=True):
+    """Render the optical geometry for one exact traced boundary state."""
+    if not isinstance(boundary, dict) or "records" not in boundary:
+        boundary = extract_reflection_count_surface_boundary(boundary)
+    records = boundary["records"]
+    if frame_index < 0 or frame_index >= len(records):
+        raise IndexError(f"frame_index {frame_index} outside 0..{len(records) - 1}.")
+    record = records[frame_index]
+    qc = np.array(record.get("qc", [np.nan, np.nan]), dtype=float)
+    frame_plan = {
+        "steps": [{
+            "step": int(frame_index + 1),
+            "mirrors": record["mirrors"],
+            "reflection_count": record["reflection_count"],
+            "qc1_error": float(qc[0]),
+            "qc2_error": float(qc[1]),
+        }],
+        "max_qc_error": float(qc_window),
+    }
+    fig, ax = render_actuation_plan_frame(
+        frame_plan,
+        frame_index=0,
+        include_start=False,
+        figsize=figsize,
+        dpi=dpi,
+        xlim=xlim,
+        ylim=ylim,
+        qc_window=qc_window,
+        draw_mount_outline=draw_mount_outline,
+        highlight_actuated_mirror=False,
+    )
+    angles4 = record["angles4"]
+    ax.set_title(
+        f"N_R={record['reflection_count']} boundary point {frame_index + 1}/{len(records)} | "
+        f"M1={angles4[0]:.6f}, M2={angles4[1]:.6f}, "
+        f"M3={angles4[2]:.6f}, M4={angles4[3]:.6f} deg\n"
+        f"QC=({qc[0]:.4g}, {qc[1]:.4g}) mm | "
+        f"u=[{record['min_u']:.4f}, {record['max_u']:.4f}]"
+    )
+    fig.tight_layout()
+    return fig, ax
+
+
+def _surface_boundary_frame_indices(frame_count, frame_stride=1, max_frames=None):
+    frame_count = int(frame_count)
+    if frame_count <= 0:
+        return []
+    frame_stride = max(1, int(frame_stride))
+    indices = list(range(0, frame_count, frame_stride))
+    if frame_count > 0 and indices[-1] != frame_count - 1:
+        indices.append(frame_count - 1)
+    if max_frames is not None and len(indices) > int(max_frames):
+        sample_positions = np.linspace(0, len(indices) - 1, max(2, int(max_frames)))
+        indices = [indices[idx] for idx in np.unique(np.rint(sample_positions).astype(int))]
+    return indices
+
+
+def _save_rendered_gif(frame_indices, renderer, output_path, fps):
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ImportError("Saving GIFs requires Pillow. Install it with `pip install pillow`.") from exc
+    frames = []
+    for frame_index in frame_indices:
+        fig, _ = renderer(frame_index)
+        image = Image.fromarray(_figure_to_rgb_array(fig))
+        frames.append(image.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+        plt.close(fig)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration_ms = int(round(1000.0 / float(fps)))
+    frames[0].save(
+        str(output_path), save_all=True, append_images=frames[1:],
+        duration=duration_ms, loop=0, disposal=2,
+    )
+    return str(output_path)
+
+
+def save_reflection_count_surface_boundary_gifs(
+        surface_or_family, N_R=None, edge="positive_branch",
+        surface_output_path=None, simulation_output_path=None,
+        fps=4, frame_stride=1, max_frames=None,
+        axes=("M1.dangle", "M2.dangle", "M3.dangle"),
+        elev=22.0, azim=-58.0, roll=0.0, radius=3.0, axis_ranges=None,
+        surface_figsize=(9, 7), simulation_figsize=(10, 5), dpi=110,
+        xlim=(-320, 230), ylim=(-15, 215), qc_window=2.0,
+        draw_mount_outline=True):
+    """Save synchronized angle-surface and optical-layout boundary GIFs.
+
+    The traced ``family`` is reused directly; this function performs no new
+    centering, curve tracing, or optimization.
+    """
+    if float(fps) <= 0:
+        raise ValueError("fps must be positive.")
+    boundary = extract_reflection_count_surface_boundary(
+        surface_or_family, N_R=N_R, edge=edge,
+    )
+    frame_indices = _surface_boundary_frame_indices(
+        boundary["frame_count"], frame_stride=frame_stride, max_frames=max_frames,
+    )
+    if len(frame_indices) == 0:
+        raise ValueError("selected boundary contains no frames.")
+    target_N_R = boundary["target_reflections"]
+    if surface_output_path is None:
+        surface_output_path = f"N_R_{target_N_R}_{boundary['edge']}_angle_surface.gif"
+    if simulation_output_path is None:
+        simulation_output_path = f"N_R_{target_N_R}_{boundary['edge']}_simulation.gif"
+
+    surface_path = _save_rendered_gif(
+        frame_indices,
+        lambda frame_index: render_reflection_count_surface_boundary_frame_3d(
+            boundary,
+            frame_index=frame_index,
+            axes=axes,
+            figsize=surface_figsize,
+            dpi=dpi,
+            elev=elev,
+            azim=azim,
+            roll=roll,
+            radius=radius,
+            axis_ranges=axis_ranges,
+        ),
+        surface_output_path,
+        fps,
+    )
+    simulation_path = _save_rendered_gif(
+        frame_indices,
+        lambda frame_index: render_reflection_count_surface_boundary_simulation_frame(
+            boundary,
+            frame_index=frame_index,
+            figsize=simulation_figsize,
+            dpi=dpi,
+            xlim=xlim,
+            ylim=ylim,
+            qc_window=qc_window,
+            draw_mount_outline=draw_mount_outline,
+        ),
+        simulation_output_path,
+        fps,
+    )
+    return {
+        "surface_gif": surface_path,
+        "simulation_gif": simulation_path,
+        "frame_count": int(len(frame_indices)),
+        "boundary_point_count": int(boundary["frame_count"]),
+        "frame_indices": np.array(frame_indices, dtype=int),
+        "boundary": boundary,
+    }
 
 
 def plot_reflection_count_surface_stage_plan_3d(
@@ -10229,8 +12649,17 @@ def plot_reflection_count_surface_stage_plan_3d(
         axis_ranges=None,
         show_plane=True,
         show_projected_jump=True,
-        marker_size=4):
-    """Plot the compact same-N_R staging model used by the surface-stage planner."""
+        marker_size=4,
+        execution=None):
+    """Plot a staging plan and optional executed angle estimates/QC readouts.
+
+    Pass the execution dictionary directly, or use execution= with a plan.
+    Hardware trajectory coordinates are angle estimates, not encoder readings.
+    QC-fit updates are shown separately, not connected as commanded moves.
+    """
+    if isinstance(plan, dict) and "actuation_plan" in plan:
+        execution = plan if execution is None else execution
+        plan = plan.get("actuation_plan")
     if not isinstance(plan, dict):
         raise TypeError("plan must be the dictionary returned by plan_reflection_count_surface_stage.")
 
@@ -10265,6 +12694,7 @@ def plot_reflection_count_surface_stage_plan_3d(
             x=[float(coord[0])],
             y=[float(coord[1])],
             z=[float(coord[2])],
+            customdata=[float(np.asarray(angles)[3])],
             mode="markers",
             marker={
                 "size": float(size),
@@ -10277,7 +12707,7 @@ def plot_reflection_count_surface_stage_plan_3d(
                 f"{name}<br>"
                 f"{axis_titles[0]}: %{{x:.6f}} deg<br>"
                 f"{axis_titles[1]}: %{{y:.6f}} deg<br>"
-                f"{axis_titles[2]}: %{{z:.6f}} deg<extra></extra>"
+                f"{axis_titles[2]}: %{{z:.6f}} deg<br>M4.dangle: %{{customdata:.6f}} deg<extra></extra>"
             ),
         ))
 
@@ -10321,7 +12751,8 @@ def plot_reflection_count_surface_stage_plan_3d(
                 "size": float(marker_size) + 1.0,
                 "color": sweep_values,
                 "colorscale": "Viridis",
-                "colorbar": {"title": f"{plan.get('sweep_actuator', 'sweep')} (deg)"},
+                "colorbar": {"title": f"{plan.get('sweep_actuator', 'sweep')} (deg)",
+                             "x": 0.81, "xanchor": "left", "thickness": 18, "len": 0.8},
             },
             line={"width": 5, "color": "rgba(44, 160, 44, 0.85)"},
             name=f"source N_R={plan.get('start_reflections')} sweep track",
@@ -10333,41 +12764,76 @@ def plot_reflection_count_surface_stage_plan_3d(
             ),
         ))
 
-    model = plan.get("source_surface_model") or {}
-    if show_plane and "plane_corners" in model:
+    for role, color in (("source", "steelblue"), ("target", "darkorange")):
+        model = plan.get(f"{role}_surface_model") or {}
+        if not show_plane or "plane_corners" not in model:
+            continue
         corners = projected_array(model["plane_corners"])
-        if corners.shape[0] >= 4:
-            fig.add_trace(go.Scatter3d(
-                x=corners[:, 0],
-                y=corners[:, 1],
-                z=corners[:, 2],
-                mode="lines",
-                line={"width": 6, "color": "rgba(80, 80, 80, 0.45)"},
-                name="bounded source plane",
-                hoverinfo="skip",
-            ))
+        if corners.shape[0] < 4:
+            continue
+        count = plan.get("start_reflections" if role == "source" else "target_N_R")
+        label = f"{role} N<sub>R</sub>={count}"
+        fig.add_trace(go.Scatter3d(
+            x=corners[:, 0], y=corners[:, 1], z=corners[:, 2], mode="lines+markers",
+            customdata=np.asarray(model["plane_corners"])[:, 3],
+            line={"width": 5, "color": color}, marker={"size": 5, "color": color},
+            name=f"{label} traced corners", hovertemplate=(
+                f"{label}<br>{axis_titles[0]}: %{{x:.6f}} deg<br>"
+                f"{axis_titles[1]}: %{{y:.6f}} deg<br>"
+                f"{axis_titles[2]}: %{{z:.6f}} deg<br>M4.dangle: %{{customdata:.6f}} deg<extra></extra>"
+            ),
+        ))
+        if "boundary_polygon2" in model:
+            polygon = model["boundary_polygon2"]
+            coefficients = np.vstack((polygon.mean(axis=0), polygon))
+            patch = np.asarray([project_angles(_quadcell_corner_surface_angles(model, value))
+                                for value in coefficients])
+            n_vertices = len(polygon)
             fig.add_trace(go.Mesh3d(
-                x=corners[:4, 0],
-                y=corners[:4, 1],
-                z=corners[:4, 2],
-                i=[0, 0],
-                j=[1, 2],
-                k=[2, 3],
-                color="rgba(120, 120, 120, 0.25)",
-                opacity=0.25,
-                name="source plane patch",
-                hoverinfo="skip",
-                showlegend=True,
+                x=patch[:, 0], y=patch[:, 1], z=patch[:, 2],
+                i=[0] * n_vertices, j=list(range(1, n_vertices + 1)),
+                k=list(range(2, n_vertices + 1)) + [1], color=color, opacity=0.20,
+                name=f"{label} fitted patch", showlegend=True, hoverinfo="skip",
+            ))
+        elif "corners4" in model:
+            patch = np.array([[
+                project_angles(_quadcell_corner_surface_angles(model, (s, t)))
+                for s in np.linspace(0, 1, 9)
+            ] for t in np.linspace(0, 1, 9)])
+            fig.add_trace(go.Surface(
+                x=patch[:, :, 0], y=patch[:, :, 1], z=patch[:, :, 2],
+                colorscale=[[0, color], [1, color]], showscale=False, opacity=0.20,
+                name=f"{label} fitted patch", showlegend=True, hoverinfo="skip",
+            ))
+        else:
+            fig.add_trace(go.Mesh3d(
+                x=corners[:4, 0], y=corners[:4, 1], z=corners[:4, 2],
+                i=[0, 0], j=[1, 2], k=[2, 3], color=color, opacity=0.20,
+                name=f"{label} plane patch", hoverinfo="skip", showlegend=True,
             ))
 
-    path_angles = []
+    path_start_angles = None
+    stage_path_angles = []
+    target_path_angles = []
     if "start_x" in plan:
-        path_angles.append(angles4_from_x(plan["start_x"]))
+        path_start_angles = angles4_from_x(plan["start_x"])
+        stage_path_angles.append(path_start_angles)
     for step in plan.get("steps", []):
         if "mirrors" in step:
-            path_angles.append(angles4_from_x(pack_variables(*step["mirrors"])))
-    if len(path_angles) >= 2:
-        path_coords = projected_array(path_angles)
+            step_angles = angles4_from_x(pack_variables(*step["mirrors"]))
+            if step.get("target_jump_step", False):
+                if not target_path_angles:
+                    target_path_angles.append(
+                        stage_path_angles[-1]
+                        if stage_path_angles else
+                        path_start_angles
+                    )
+                target_path_angles.append(step_angles)
+            else:
+                stage_path_angles.append(step_angles)
+
+    if len(stage_path_angles) >= 2:
+        path_coords = projected_array(stage_path_angles)
         fig.add_trace(go.Scatter3d(
             x=path_coords[:, 0],
             y=path_coords[:, 1],
@@ -10382,14 +12848,47 @@ def plot_reflection_count_surface_stage_plan_3d(
                 f"{axis_titles[2]}: %{{z:.6f}} deg<extra></extra>"
             ),
         ))
+    if len(target_path_angles) >= 2:
+        target_path_coords = projected_array([
+            angles for angles in target_path_angles
+            if angles is not None
+        ])
+        if target_path_coords.shape[0] >= 2:
+            fig.add_trace(go.Scatter3d(
+                x=target_path_coords[:, 0],
+                y=target_path_coords[:, 1],
+                z=target_path_coords[:, 2],
+                mode="lines+markers",
+                marker={"size": float(marker_size) + 2.0, "color": "darkorange"},
+                line={"width": 7, "color": "darkorange", "dash": "dash"},
+                name="planned target jump path",
+                hovertemplate=(
+                    f"{axis_titles[0]}: %{{x:.6f}} deg<br>"
+                    f"{axis_titles[1]}: %{{y:.6f}} deg<br>"
+                    f"{axis_titles[2]}: %{{z:.6f}} deg<extra></extra>"
+                ),
+            ))
 
     if "start_x" in plan:
         add_marker(fig, "current source base", angles4_from_x(plan["start_x"]), "black", size=10)
+    if plan.get("source_repair_applied") and "source_seed_x" in plan:
+        add_marker(
+            fig,
+            "source repaired inside u bounds",
+            angles4_from_x(plan["source_seed_x"]),
+            "deepskyblue",
+            symbol="diamond",
+            size=10,
+        )
     target_base_angles = plan.get("target_base_angles4")
     if target_base_angles is None and "target_base_x" in plan:
         target_base_angles = angles4_from_x(plan["target_base_x"])
     if target_base_angles is not None:
-        add_marker(fig, f"solved target N_R={plan.get('target_N_R')} base", target_base_angles, "orange", size=10)
+        add_marker(fig, f"target N_R={plan.get('target_N_R')} solve seed (not destination)",
+                   target_base_angles, "gray", symbol="circle", size=6)
+    selected_target_angles = plan.get("selected_target_angles4", target_base_angles)
+    if plan.get("selected_target_angles4") is not None:
+        add_marker(fig, "selected nearest target point", selected_target_angles, "darkorange", size=14)
     if "stage_angles4" in plan:
         add_marker(fig, "selected staging point", plan["stage_angles4"], "crimson", symbol="diamond", size=11)
     elif "stage_x" in plan:
@@ -10398,8 +12897,15 @@ def plot_reflection_count_surface_stage_plan_3d(
     if (
             show_projected_jump and
             "stage_angles4" in plan and
-            target_base_angles is not None):
-        jump_coords = projected_array([plan["stage_angles4"], target_base_angles])
+            selected_target_angles is not None):
+        jump_coords = projected_array([plan["stage_angles4"], selected_target_angles])
+        gap = np.asarray(selected_target_angles) - np.asarray(plan["stage_angles4"])
+        active_gap_indices = [angle_labels.index(label) for label in plan.get(
+            "active_actuators", ["M1.dangle", "M2.dangle", "M3.dangle"])]
+        gap_text = (
+            f"Active-angle gap: {np.linalg.norm(gap[active_gap_indices]):.6g} deg<br>"
+            f"M4 angle gap: {gap[3]:+.6g} deg"
+        )
         fig.add_trace(go.Scatter3d(
             x=jump_coords[:, 0],
             y=jump_coords[:, 1],
@@ -10407,16 +12913,139 @@ def plot_reflection_count_surface_stage_plan_3d(
             mode="lines",
             line={"width": 4, "color": "rgba(255, 127, 14, 0.8)"},
             name="stage-to-target angle gap",
-            hoverinfo="skip",
+            text=[gap_text, gap_text],
+            hovertemplate="%{text}<extra></extra>",
         ))
 
+    if execution is not None:
+        dry_run = bool(execution.get("dry_run", False))
+        rows = []
+        descriptions = []
+        update_rows = []
+        update_descriptions = []
+
+        def add_estimate_update(angles, description):
+            if not rows:
+                rows.append(angles)
+                descriptions.append(description)
+            elif not np.allclose(rows[-1], angles, rtol=0, atol=1e-12):
+                update_rows.extend([rows[-1], angles, None])
+                update_descriptions.extend([description, description, None])
+                rows.extend([None, angles])
+                descriptions.extend([None, description])
+
+        if "start_x" in plan:
+            rows.append(angles4_from_x(plan["start_x"]))
+            descriptions.append("execution start (after calibration)")
+        for entry in execution.get("execution_log", []):
+            before_x = entry.get("physical_x_before_step") if dry_run else None
+            if before_x is None:
+                before_x = entry.get("estimate_x_before_step")
+            if before_x is not None:
+                add_estimate_update(
+                    angles4_from_x(before_x),
+                    f"angle-estimate update before step {entry.get('execution_step')}<br>"
+                    "No motor command represented by this connector",
+                )
+            fit = entry.get("stage_assimilation") or entry.get("reacquisition_assimilation")
+            samples = entry.get("pulses") or entry.get("chunks") or []
+            has_pulse_positions = any(
+                p.get("estimate_x_after_pulse") is not None or
+                (dry_run and p.get("physical_x_after_pulse") is not None)
+                for p in samples
+            )
+            if not has_pulse_positions:
+                samples = [entry]
+            for sample in samples:
+                sample_x = None
+                if dry_run:
+                    sample_x = sample.get("physical_x_after_pulse", sample.get("physical_x_after_step"))
+                if sample_x is None:
+                    sample_x = sample.get("estimate_x_after_pulse", sample.get("estimate_x_after_step"))
+                if sample_x is None:
+                    continue
+                if not dry_run and not has_pulse_positions and fit and "angle_prior" in fit:
+                    sample_x = np.array(sample_x, dtype=float).copy()
+                    sample_x[int(entry["axis_index"])] = float(fit["angle_prior"])
+                before_sample_angles = rows[-1] if rows else None
+                rows.append(angles4_from_x(sample_x))
+                qc = sample.get("qc_x", sample.get("after_qc_x", [np.nan, np.nan]))
+                valid = sample.get("qc_signal_valid", sample.get("after_qc_signal_valid"))
+                descriptions.append(
+                    f"step {entry.get('execution_step')}, pulse {sample.get('pulse', 'end')}<br>"
+                    f"{entry.get('actuator')}<br>QC readout: ({qc[0]:.4f}, {qc[1]:.4f})<br>"
+                    f"position valid: {valid}<br>"
+                    f"M4.dangle: {rows[-1][3]:.6f} deg"
+                )
+                if sample.get("rolled_back") and before_sample_angles is not None:
+                    rows.append(before_sample_angles.copy())
+                    descriptions.append(
+                        f"step {entry.get('execution_step')}, pulse {sample.get('pulse', 'end')}<br>"
+                        f"{entry.get('actuator')}: commanded safety rollback"
+                    )
+            after_x = entry.get("physical_x_after_step") if dry_run else None
+            if after_x is None:
+                after_x = entry.get("estimate_x_after_step")
+            if not dry_run and fit and after_x is not None:
+                add_estimate_update(
+                    angles4_from_x(after_x),
+                    f"QC-fit angle update after step {entry.get('execution_step')}<br>"
+                    f"{entry.get('actuator')}<br>No motor command represented by this connector",
+                )
+        # Older records may omit a partially executed step but retain its
+        # final angle estimate. Include that endpoint without inventing samples.
+        final_mirrors = execution.get("final_mirrors")
+        if final_mirrors is not None and not dry_run:
+            final_angles = angles4_from_x(pack_variables(*final_mirrors))
+            if not rows or not np.allclose(rows[-1], final_angles, rtol=0, atol=1e-12):
+                rows.append(final_angles)
+                descriptions.append("final recorded angle estimate (intermediate samples unavailable)")
+        if rows and execution.get("execution_log"):
+            coords = projected_array([
+                np.full(4, np.nan) if row is None else row for row in rows
+            ])
+            name = "dry-run physical path" if dry_run else "executed path (pulse angle estimate)"
+            fig.add_trace(go.Scatter3d(
+                x=coords[:, 0], y=coords[:, 1], z=coords[:, 2],
+                mode="lines+markers", name=name,
+                line={"color": "deepskyblue", "width": 5},
+                marker={"color": "deepskyblue", "size": 3},
+                connectgaps=False,
+                text=descriptions,
+                hovertemplate=(
+                    "%{text}<br>"
+                    f"{axis_titles[0]}: %{{x:.6f}} deg<br>"
+                    f"{axis_titles[1]}: %{{y:.6f}} deg<br>"
+                    f"{axis_titles[2]}: %{{z:.6f}} deg<extra></extra>"
+                ),
+            ))
+            add_marker(
+                fig, "execution stopped" if not execution.get("success") else "execution end",
+                rows[-1], "deepskyblue", symbol="x", size=9,
+            )
+        if update_rows:
+            update_coords = projected_array([
+                np.full(4, np.nan) if row is None else row for row in update_rows
+            ])
+            fig.add_trace(go.Scatter3d(
+                x=update_coords[:, 0], y=update_coords[:, 1], z=update_coords[:, 2],
+                mode="lines+markers", name="angle-estimate updates (not commanded moves)",
+                line={"color": "dimgray", "width": 3, "dash": "dot"},
+                marker={"color": "dimgray", "size": 3},
+                text=update_descriptions,
+                hovertemplate="%{text}<extra></extra>",
+                connectgaps=False,
+            ))
+
+    scene = _plotly_3d_scene(axis_titles, axis_ranges=axis_ranges)
+    scene["domain"] = {"x": [0.0, 0.78], "y": [0.0, 1.0]}
     fig.update_layout(
         title=plot_title,
         width=None if width == "100%" else width,
         height=int(height),
-        scene=_plotly_3d_scene(axis_titles, axis_ranges=axis_ranges),
-        margin={"l": 0, "r": 0, "t": 40, "b": 0},
-        legend={"itemsizing": "constant"},
+        scene=scene,
+        margin={"l": 0, "r": 240, "t": 40, "b": 0},
+        legend={"itemsizing": "constant", "x": 1.02, "xanchor": "left", "y": 1.0},
     )
     if show:
         if renderer is not None:
@@ -12118,10 +14747,23 @@ def sim_aruco_pts_by_mirror(M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y, M1a, M2a, M3
 def sim_reflection_pts_by_mirror(
     M1x, M2x, M3x, M4x,
     M1y, M2y, M3y, M4y,
-    M1a, M2a, M3a, M4a
+    M1a, M2a, M3a, M4a,
+    *, expected_reflections=None
 ):
+    """Project reflections into image pixels, grouped by mirror.
+
+    By default, trace the solved configuration's physical reflection count.
+    An explicit count uses the same ordered intersections as the inverse solver.
+    """
+    if expected_reflections is None:
+        mirrors = mirrors_from_inverse_theta([
+            M1x, M2x, M3x, M4x, M1y, M2y, M3y, M4y,
+            M1a, M2a, M3a, M4a
+        ])
+        expected_reflections = get_reflection_count(*mirrors)
+
     path = simulation_reflec(M1x, M1y, M2x, M2y, M3x, M3y, M4x, M4y,
-        M1a, M2a, M3a, M4a)
+        M1a, M2a, M3a, M4a, expected_reflections=expected_reflections)
 
     grouped = {"M1": [], "M2": [], "M3": [], "M4": []}
 
@@ -12147,14 +14789,18 @@ def overlay_reflections_and_aruco(
     reflec_sim_by_mirror=None,
     aruco_sim_by_mirror=None,
     title="ArUcos + Reflections Overlay",
+    *, show=True,
 ):
+    from matplotlib.lines import Line2D
+    from matplotlib.legend_handler import HandlerTuple
+
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.imshow(cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB))
-    ax.set_title(title)
-    ax.set_xlabel("x [px]")
-    ax.set_ylabel("y [px]")
+    ax.set_xlabel("x [px]", fontsize=20)
+    ax.set_ylabel("y [px]", fontsize=20)
+    ax.tick_params(axis="both", labelsize=18)
 
-    mirror_colors = {"M1": "cyan", "M2": "yellow", "M3": "lime", "M4": "magenta"}
+    aruco_color = "lime"
 
     # --- measured reflections (red open circles) ---
     if reflec_meas_by_mirror:
@@ -12165,7 +14811,7 @@ def overlay_reflections_and_aruco(
         if all_meas:
             rx, ry = zip(*all_meas)
             ax.scatter(rx, ry, s=120, facecolors="none", edgecolors="red",
-                       linewidths=2, label="Reflections (measured)")
+                       linewidths=2, label="_nolegend_")
 
     # --- simulated reflections (red x) ---
     if reflec_sim_by_mirror:
@@ -12176,9 +14822,9 @@ def overlay_reflections_and_aruco(
         if all_sim:
             sx, sy = zip(*all_sim)
             ax.scatter(sx, sy, s=90, marker="x", linewidths=2,
-                       c="red", label="Reflections (sim)")
+                       c="red", label="_nolegend_")
 
-    # --- measured arucos (colored square) ---
+    # --- measured arucos (green square) ---
     if aruco_meas_by_mirror:
         for mname, pts in aruco_meas_by_mirror.items():
             if not pts:
@@ -12191,11 +14837,11 @@ def overlay_reflections_and_aruco(
                 s=260,
                 linewidths=3,
                 facecolors='none',   # hollow
-                edgecolors=mirror_colors.get(mname, "white"),
-                label=f"{mname} ArUco (measured)"
+                edgecolors=aruco_color,
+                label="_nolegend_"
             )
 
-    # --- simulated arucos (colored x) ---
+    # --- simulated arucos (green x) ---
     if aruco_sim_by_mirror:
         for mname, pts in aruco_sim_by_mirror.items():
             if not pts:
@@ -12203,14 +14849,27 @@ def overlay_reflections_and_aruco(
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
             ax.scatter(xs, ys, marker="x", s=90, linewidths=2,
-                       c=mirror_colors.get(mname, "white"),
-                       label=f"{mname} ArUco (sim)")
+                       c=aruco_color,
+                       label="_nolegend_")
 
-    #ax.legend(loc="lower center", bbox_to_anchor=(0.5, 0.02), ncol=2, labelspacing=1., framealpha=0.9)
+    legend_handles = [
+        tuple(
+            Line2D([], [], color="black", marker=marker, linestyle="none",
+                   markerfacecolor="none", markeredgewidth=2, markersize=12)
+            for marker in ("o", "s")
+        ),
+        Line2D([], [], color="black", marker="x", linestyle="none",
+               markeredgewidth=2, markersize=12),
+    ]
+    ax.legend(handles=legend_handles, labels=["Measured", "Sim"],
+              handler_map={tuple: HandlerTuple(ndivide=None, pad=0.6)},
+              handlelength=3.0, loc="lower center",
+              bbox_to_anchor=(0.5, 0.02), ncol=2, fontsize=18, framealpha=0.9)
     ax.set_xlim(0, img_bgr.shape[1])
     ax.set_ylim(img_bgr.shape[0], 0)  # image coords (origin top-left)
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
     return fig, ax
 
 def group_aruco_centers_by_mirror(centers12):
